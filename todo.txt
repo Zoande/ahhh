@@ -1,0 +1,322 @@
+PROJECT SUMMARY
+
+Name: Browser Space Strategy Prototype – Phase 1
+Goal: Implement a browser-based 3D prototype featuring a static galaxy background and a single zoomable star system containing one star and three textured planets (rock, gas, ice).
+Scope: Rendering architecture, scene switching, camera system, textured celestial bodies, smooth zoom transition.
+Out of Scope: Multiplayer, UI systems, economy, combat, procedural generation, persistence.
+
+Core Requirements
+
+1. One static galaxy background using an image texture.
+2. One clickable star object in galaxy view.
+3. Smooth zoom toward star.
+4. Transition into system view.
+5. System contains:
+
+   * 1 textured star
+   * 1 rocky planet
+   * 1 gas giant
+   * 1 ice planet
+6. Planets orbit the star.
+7. Stable 60 FPS on average laptop.
+8. Clean scene lifecycle management (no memory leaks).
+
+TECH STACK
+
+Frontend:
+Babylon.js
+WebGPU (fallback WebGL2)
+TypeScript
+Vite
+
+No backend required for this phase.
+
+PROJECT STRUCTURE
+
+/src
+main.ts
+SceneManager.ts
+scenes/
+GalaxyScene.ts
+SystemScene.ts
+systems/
+CameraController.ts
+TransitionController.ts
+OrbitSystem.ts
+assets/
+textures/
+galaxy_bg.jpg
+star_surface.jpg
+rocky_planet.jpg
+gas_giant.jpg
+ice_planet.jpg
+
+TEXTURE REQUIREMENTS
+
+Total textures: 5
+
+1. galaxy_bg.jpg
+   Resolution: 2048x2048 max
+   Used on fullscreen plane or skybox
+   No lighting
+
+2. star_surface.jpg
+   Resolution: 1024–2048
+   Used on star sphere
+   Emissive material
+
+3. rocky_planet.jpg
+   Resolution: 1024–2048
+   Standard material
+
+4. gas_giant.jpg
+   Resolution: 1024–2048
+   Standard material
+
+5. ice_planet.jpg
+   Resolution: 1024–2048
+   Standard material
+
+Keep all textures compressed and optimized.
+
+ARCHITECTURE OVERVIEW
+
+SceneManager
+Responsible for:
+- Engine initialization
+- Scene switching
+- Scene disposal
+- Render loop
+
+Two scene states:
+GalaxyScene
+SystemScene
+
+TransitionController handles:
+
+* Fade in/out
+* Zoom threshold detection
+* Scene swap trigger
+
+CameraController handles:
+
+* Orbit camera setup
+* Zoom limits
+* Smooth interpolation
+
+OrbitSystem handles:
+
+* Planet angular velocity
+* Position updates per frame
+
+SCENE: GALAXY VIEW
+
+Purpose:
+Display background and a single star representing the system.
+
+Objects:
+
+1. Background
+
+   * Large plane or skybox
+   * Unlit material
+   * galaxy_bg.jpg applied
+   * Always behind all objects
+
+2. System Star
+
+   * Sphere mesh
+   * star_surface.jpg
+   * Emissive material
+   * Glow layer enabled
+   * Slowly rotating
+
+3. Camera
+
+   * ArcRotateCamera
+   * Target: star
+   * Limited zoom range
+   * Smooth wheel zoom enabled
+
+Interaction:
+
+On pointer click:
+
+* Raycast
+* If star mesh hit:
+  initiate zoom sequence
+
+Zoom Logic:
+
+If camera radius < defined threshold:
+Trigger transition to SystemScene
+
+SCENE: SYSTEM VIEW
+
+Purpose:
+Render detailed star system.
+
+Objects:
+
+1. Star
+
+   * Sphere mesh
+   * Emissive material
+   * Glow layer
+   * PointLight at center
+   * Slow axial rotation
+
+2. Rocky Planet
+
+   * Sphere mesh
+   * rocky_planet.jpg
+   * Distance: small orbit radius
+   * Moderate orbit speed
+   * Slow axial rotation
+
+3. Gas Giant
+
+   * Larger sphere
+   * gas_giant.jpg
+   * Larger orbit radius
+   * Slower orbit speed
+   * Slower axial rotation
+
+4. Ice Planet
+
+   * Smaller sphere
+   * ice_planet.jpg
+   * Medium orbit radius
+   * Faster orbit speed
+   * Moderate axial rotation
+
+5. Lighting
+
+   * PointLight positioned at star center
+   * Intensity tuned for balanced illumination
+   * Optional subtle ambient light
+
+Camera:
+
+ArcRotateCamera
+Target: star center
+Zoom range clamped
+Orbit allowed
+No free-flight
+
+ORBIT SYSTEM DESIGN
+
+Each planet stores:
+orbitRadius
+orbitSpeed
+currentAngle
+
+Per frame:
+currentAngle += orbitSpeed * deltaTime
+
+position.x = cos(currentAngle) * orbitRadius
+position.z = sin(currentAngle) * orbitRadius
+position.y = 0
+
+Axial rotation:
+planet.rotation.y += rotationSpeed * deltaTime
+
+No physics engine required.
+
+TRANSITION SYSTEM
+
+Trigger:
+Zoom threshold OR star click
+
+Steps:
+
+1. Disable user input
+2. Fade screen to black (0.3–0.6s)
+3. Dispose current scene meshes
+4. Instantiate next scene
+5. Position camera appropriately
+6. Fade in
+7. Re-enable input
+
+Ensure:
+All textures disposed properly
+No duplicated lights
+No orphaned meshes
+
+PERFORMANCE TARGETS
+
+Triangle budget:
+< 200k
+
+Texture count:
+5 total
+
+Texture resolution:
+≤ 2048
+
+Transparent materials:
+Avoid heavy layering
+
+Post-processing:
+Optional bloom only
+
+Target hardware:
+Integrated Intel / AMD GPU
+8–16 GB RAM laptops
+
+Frame rate:
+60 FPS target
+Minimum acceptable 45 FPS
+
+DEFINITION OF DONE
+
+Galaxy Scene:
+
+* Background renders correctly
+* Star rotates
+* Camera zoom smooth
+* Click detection works
+
+Transition:
+
+* Smooth fade
+* No visual popping
+* No frame spike > 16ms
+
+System Scene:
+
+* Star emits light
+* 3 planets orbit smoothly
+* Textures display correctly
+* Camera orbit stable
+
+Memory:
+
+* No increasing GPU memory after repeated transitions
+* Scenes fully disposed
+
+Performance:
+
+* Stable 60 FPS on development machine
+
+FUTURE EXTENSION READY
+
+Architecture must support:
+
+* Multiple systems
+* UI overlay layer
+* Fleet meshes
+* Instanced rendering
+* LOD system
+* Server-synced state
+* Compute shaders later
+
+This prototype validates:
+
+Rendering pipeline
+Scene lifecycle
+Texture management
+Camera system
+Performance baseline
+WebGPU compatibility
+
