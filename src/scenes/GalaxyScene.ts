@@ -1,3 +1,19 @@
+/**
+ * GalaxyScene — Main scene orchestrator.
+ *
+ * Layers:
+ *   1. Background skybox (galaxy_bg.png)
+ *   2. Star field (1000 sprite glows via StarFieldRenderer)
+ *   3. Active system (star mesh + planets, built on demand when zoomed in)
+ *
+ * Seamless zoom transition with:
+ *  - Target locking (prevents switching stars mid-transition)
+ *  - Neighbor suppression (fade + shrink nearby stars)
+ *  - Camera magnetization (gradual centering on focused star)
+ *  - Non-linear system scaling (spatial decoupling trick)
+ *  - Smooth reverse transition on zoom-out
+ */
+
 import {
   Scene,
   Vector3,
@@ -13,116 +29,61 @@ import {
 } from "@babylonjs/core";
 import type { AbstractEngine, Mesh } from "@babylonjs/core";
 import type { IGameScene } from "../SceneManager";
+import { GALAXY_MAP } from "../data/GalaxyMap";
+import { generateStarMap, STAR_TYPES } from "../data/StarMap";
+import type { StarData } from "../data/StarMap";
 import { CameraController } from "../systems/CameraController";
+import { StarFieldRenderer } from "../systems/StarFieldRenderer";
 import { OrbitSystem } from "../systems/OrbitSystem";
 
-/* ─────────────────────── Star / System data ─────────────────────── */
+/* ═══════════════════════ Transition state ═══════════════════════ */
 
-interface SystemConfig {
-  starDiameter: number;
-  rocky:  { diameter: number; orbitRadius: number; orbitSpeed: number };
-  gas:    { diameter: number; orbitRadius: number; orbitSpeed: number };
-  ice:    { diameter: number; orbitRadius: number; orbitSpeed: number };
+const enum TransitionPhase {
+  /** Full galaxy view — no system active */
+  GALAXY = 0,
+  /** Zooming in — blend increasing from 0→1 */
+  ZOOMING_IN = 1,
+  /** Fully inside a system */
+  IN_SYSTEM = 2,
+  /** Zooming back out — blend decreasing from 1→0 */
+  ZOOMING_OUT = 3,
 }
 
-interface StarDef {
-  id: number;
-  name: string;
-  position: Vector3;      // galaxy-plane position
-  glowSize: number;       // diameter of the glow sphere seen from afar
-  color: Color3;
-  system: SystemConfig;
-}
+/* ═══════════════════════ Active system runtime ═══════════════════════ */
 
-/** 5 stars, spread hundreds of units apart */
-const STARS: StarDef[] = [
-  {
-    id: 0, name: "Sol",
-    position: new Vector3(0, 0, 0),
-    glowSize: 6, color: new Color3(1, 0.92, 0.7),
-    system: {
-      starDiameter: 5,
-      rocky: { diameter: 1.5, orbitRadius: 8, orbitSpeed: 0.50 },
-      gas:   { diameter: 3.0, orbitRadius: 18, orbitSpeed: 0.20 },
-      ice:   { diameter: 1.2, orbitRadius: 13, orbitSpeed: 0.70 },
-    },
-  },
-  {
-    id: 1, name: "Vega",
-    position: new Vector3(250, 0, -180),
-    glowSize: 7, color: new Color3(0.75, 0.85, 1),
-    system: {
-      starDiameter: 5.5,
-      rocky: { diameter: 1.2, orbitRadius: 9, orbitSpeed: 0.45 },
-      gas:   { diameter: 3.8, orbitRadius: 20, orbitSpeed: 0.18 },
-      ice:   { diameter: 1.0, orbitRadius: 14, orbitSpeed: 0.65 },
-    },
-  },
-  {
-    id: 2, name: "Antares",
-    position: new Vector3(-300, 0, 150),
-    glowSize: 9, color: new Color3(1, 0.55, 0.3),
-    system: {
-      starDiameter: 6.5,
-      rocky: { diameter: 1.8, orbitRadius: 10, orbitSpeed: 0.40 },
-      gas:   { diameter: 4.2, orbitRadius: 22, orbitSpeed: 0.15 },
-      ice:   { diameter: 1.4, orbitRadius: 15, orbitSpeed: 0.55 },
-    },
-  },
-  {
-    id: 3, name: "Rigel",
-    position: new Vector3(180, 0, 260),
-    glowSize: 7.5, color: new Color3(0.7, 0.8, 1),
-    system: {
-      starDiameter: 5.8,
-      rocky: { diameter: 1.0, orbitRadius: 7, orbitSpeed: 0.55 },
-      gas:   { diameter: 2.6, orbitRadius: 16, orbitSpeed: 0.22 },
-      ice:   { diameter: 1.6, orbitRadius: 12, orbitSpeed: 0.75 },
-    },
-  },
-  {
-    id: 4, name: "Betelgeuse",
-    position: new Vector3(-200, 0, -280),
-    glowSize: 10, color: new Color3(1, 0.6, 0.35),
-    system: {
-      starDiameter: 7.0,
-      rocky: { diameter: 2.0, orbitRadius: 11, orbitSpeed: 0.35 },
-      gas:   { diameter: 3.4, orbitRadius: 24, orbitSpeed: 0.12 },
-      ice:   { diameter: 1.1, orbitRadius: 16, orbitSpeed: 0.60 },
-    },
-  },
-];
-
-/* ─────────────── Transition thresholds ─────────────── */
-
-/** Distance from camera target to a star to consider it "focused" */
-const FOCUS_DIST = 60;
-/** Camera radius at which the glow starts fading out and system fades in */
-const TRANSITION_START = 55;
-/** Camera radius at which the system is fully visible and glow gone */
-const TRANSITION_END = 18;
-
-/* ─────────────── Per-star runtime data ─────────────── */
-
-interface StarRuntime {
-  def: StarDef;
-  glowMesh: Mesh;
-  systemRoot: TransformNode;
+interface ActiveSystem {
+  starId: number;
+  root: TransformNode;
   starMesh: Mesh;
   planetMeshes: Mesh[];
   light: PointLight;
   orbitSystem: OrbitSystem;
-  systemVisible: boolean;
 }
 
-/* ═══════════════════════════════════════════════════════════════════ */
+/* ═══════════════════════ GalaxyScene ═══════════════════════ */
 
 export class GalaxyScene implements IGameScene {
   public scene: Scene;
   private engine: AbstractEngine;
   private cam!: CameraController;
-  private starRuntimes: StarRuntime[] = [];
+  private starField!: StarFieldRenderer;
+  private stars: StarData[] = [];
   private glowLayer!: GlowLayer;
+
+  // Currently loaded star system (only one at a time)
+  private activeSystem: ActiveSystem | null = null;
+
+  // Transition state
+  private phase: TransitionPhase = TransitionPhase.GALAXY;
+  private lockedStarId = -1;         // Target-locked star during transition
+  private blend = 0;                 // 0 = galaxy, 1 = fully in system
+  private suppressionBlend = 0;      // Smoothed suppression strength
+
+  // Shared textures (preloaded once, reused for any system)
+  private surfaceTex!: Texture;
+  private rockyTex!: Texture;
+  private gasTex!: Texture;
+  private iceTex!: Texture;
 
   constructor(engine: AbstractEngine) {
     this.engine = engine;
@@ -130,25 +91,42 @@ export class GalaxyScene implements IGameScene {
     this.scene.clearColor = new Color4(0, 0, 0, 1);
   }
 
+  /* ─────────────────────── Setup ─────────────────────── */
+
   async setup(): Promise<void> {
     const canvas = this.engine.getRenderingCanvas()!;
+    const cfg = GALAXY_MAP;
 
-    // ── Camera: 2.5D isometric-ish, big zoom range ──
+    // ── Generate the star map ──
+    this.stars = generateStarMap(
+      cfg.width, cfg.height, cfg.starCount, cfg.seed, cfg.minStarSpacing, cfg.shape,
+    );
+    console.log(`Generated ${this.stars.length} stars`);
+
+    // ── Camera ──
     this.cam = new CameraController(this.scene, canvas, {
-      alpha: -Math.PI / 2,
-      beta: Math.PI / 4,
-      radius: 120,
+      alpha: cfg.camera.startAlpha,
+      beta: cfg.camera.startBeta,
+      radius: cfg.camera.startRadius,
       target: Vector3.Zero(),
-      lowerRadiusLimit: 5,
-      upperRadiusLimit: 300,
-      lowerBetaLimit: 0.25,
-      upperBetaLimit: Math.PI / 3,
-      wheelPrecision: 5,
-      inertia: 0.88,
+      lowerRadiusLimit: cfg.camera.minRadius,
+      upperRadiusLimit: cfg.camera.maxRadius,
+      lowerBetaLimit: cfg.camera.minBeta,
+      upperBetaLimit: cfg.camera.maxBeta,
+      wheelDeltaPercentage: cfg.camera.wheelDeltaPercentage,
+      inertia: cfg.camera.inertia,
     });
 
+    // Clamp panning to the galaxy bounds
+    this.cam.setBounds(
+      -cfg.width / 2, cfg.width / 2,
+      -cfg.height / 2, cfg.height / 2,
+    );
+
     // ── Background skybox ──
-    const bgSphere = MeshBuilder.CreateSphere("bg", { diameter: 2000, segments: 24 }, this.scene);
+    const bgSphere = MeshBuilder.CreateSphere(
+      "bg", { diameter: 5000, segments: 24 }, this.scene,
+    );
     const bgMat = new StandardMaterial("bgMat", this.scene);
     bgMat.emissiveTexture = new Texture("/textures/galaxy_bg.png", this.scene);
     bgMat.disableLighting = true;
@@ -157,227 +135,361 @@ export class GalaxyScene implements IGameScene {
     bgSphere.isPickable = false;
     bgSphere.infiniteDistance = true;
 
-    // ── Glow layer ──
+    // ── Glow layer (for system star + planets when zoomed in) ──
     this.glowLayer = new GlowLayer("glow", this.scene, {
-      mainTextureFixedSize: 1024,
-      blurKernelSize: 64,
+      mainTextureFixedSize: 512,
+      blurKernelSize: 32,
     });
-    this.glowLayer.intensity = 1.4;
+    this.glowLayer.intensity = 1.2;
 
-    // ── Subtle ambient for planets when they appear ──
+    // ── Subtle ambient light for planets ──
     const ambient = new HemisphericLight("ambient", new Vector3(0, 1, 0), this.scene);
     ambient.intensity = 0.08;
     ambient.diffuse = new Color3(0.3, 0.35, 0.5);
-    ambient.specular = new Color3(0, 0, 0);
+    ambient.specular = Color3.Black();
 
-    // ── Shared textures ──
-    const glowTex     = new Texture("/textures/star.glow.png", this.scene);
-    const surfaceTex  = new Texture("/textures/star_surface.png", this.scene);
-    const rockyTex    = new Texture("/textures/rocky_planet.png", this.scene);
-    const gasTex      = new Texture("/textures/gas_giant.png", this.scene);
-    const iceTex      = new Texture("/textures/ice_planet.png", this.scene);
+    // ── Star field (all 1000 stars as billboard sprites) ──
+    this.starField = new StarFieldRenderer(this.scene, this.stars);
 
-    // ── Build each star ──
-    for (const def of STARS) {
-      const rt = this.buildStar(def, glowTex, surfaceTex, rockyTex, gasTex, iceTex);
-      this.starRuntimes.push(rt);
-    }
+    // ── Preload shared textures for system view ──
+    this.surfaceTex = new Texture("/textures/star_surface.png", this.scene);
+    this.rockyTex = new Texture("/textures/rocky_planet.png", this.scene);
+    this.gasTex = new Texture("/textures/gas_giant.png", this.scene);
+    this.iceTex = new Texture("/textures/ice_planet.png", this.scene);
 
     await this.scene.whenReadyAsync();
   }
 
-  /* ─────────── Build one star with glow + system ─────────── */
-
-  private buildStar(
-    def: StarDef,
-    glowTex: Texture,
-    surfaceTex: Texture,
-    rockyTex: Texture,
-    gasTex: Texture,
-    iceTex: Texture,
-  ): StarRuntime {
-    const cfg = def.system;
-
-    // ── Glow sphere (visible from galaxy distance) ──
-    const glowMesh = MeshBuilder.CreateSphere(
-      `glow_${def.id}`, { diameter: def.glowSize, segments: 16 }, this.scene
-    );
-    const glowMat = new StandardMaterial(`glowMat_${def.id}`, this.scene);
-    glowMat.emissiveTexture = glowTex;
-    glowMat.emissiveColor = def.color;
-    glowMat.diffuseColor = Color3.Black();
-    glowMat.specularColor = Color3.Black();
-    glowMat.disableLighting = true;
-    glowMat.alpha = 1;
-    glowMesh.material = glowMat;
-    glowMesh.position = def.position.clone();
-    glowMesh.isPickable = false;
-    this.glowLayer.addIncludedOnlyMesh(glowMesh);
-
-    // ── System root (parent transform for star surface + planets) ──
-    const systemRoot = new TransformNode(`sysRoot_${def.id}`, this.scene);
-    systemRoot.position = def.position.clone();
-
-    // Star surface
-    const starMesh = MeshBuilder.CreateSphere(
-      `star_${def.id}`, { diameter: cfg.starDiameter, segments: 32 }, this.scene
-    );
-    const starMat = new StandardMaterial(`starSurfMat_${def.id}`, this.scene);
-    starMat.emissiveTexture = surfaceTex;
-    starMat.emissiveColor = def.color.scale(0.9);
-    starMat.diffuseColor = Color3.Black();
-    starMat.specularColor = Color3.Black();
-    starMat.disableLighting = true;
-    starMesh.material = starMat;
-    starMesh.parent = systemRoot;
-    starMesh.isPickable = false;
-    this.glowLayer.addIncludedOnlyMesh(starMesh);
-
-    // Point light at star center
-    const light = new PointLight(`light_${def.id}`, Vector3.Zero(), this.scene);
-    light.parent = systemRoot;
-    light.intensity = 0; // starts invisible
-    light.diffuse = new Color3(1, 0.95, 0.85);
-    light.specular = new Color3(1, 0.95, 0.85);
-    light.range = 50;
-
-    // ── Planets ──
-    const orbitSystem = new OrbitSystem();
-    const planetMeshes: Mesh[] = [];
-
-    // Rocky
-    const rocky = MeshBuilder.CreateSphere(`rocky_${def.id}`, { diameter: cfg.rocky.diameter, segments: 20 }, this.scene);
-    const rockyMat = new StandardMaterial(`rockyMat_${def.id}`, this.scene);
-    rockyMat.diffuseTexture = rockyTex;
-    rockyMat.specularColor = new Color3(0.1, 0.1, 0.1);
-    rocky.material = rockyMat;
-    rocky.parent = systemRoot;
-    planetMeshes.push(rocky);
-    orbitSystem.addBody({
-      mesh: rocky,
-      orbitRadius: cfg.rocky.orbitRadius,
-      orbitSpeed: cfg.rocky.orbitSpeed,
-      currentAngle: Math.random() * Math.PI * 2,
-      axialRotationSpeed: 0.3,
-    });
-
-    // Gas giant
-    const gas = MeshBuilder.CreateSphere(`gas_${def.id}`, { diameter: cfg.gas.diameter, segments: 20 }, this.scene);
-    const gasMat = new StandardMaterial(`gasMat_${def.id}`, this.scene);
-    gasMat.diffuseTexture = gasTex;
-    gasMat.specularColor = new Color3(0.05, 0.05, 0.05);
-    gas.material = gasMat;
-    gas.parent = systemRoot;
-    planetMeshes.push(gas);
-    orbitSystem.addBody({
-      mesh: gas,
-      orbitRadius: cfg.gas.orbitRadius,
-      orbitSpeed: cfg.gas.orbitSpeed,
-      currentAngle: Math.random() * Math.PI * 2,
-      axialRotationSpeed: 0.15,
-    });
-
-    // Ice
-    const ice = MeshBuilder.CreateSphere(`ice_${def.id}`, { diameter: cfg.ice.diameter, segments: 20 }, this.scene);
-    const iceMat = new StandardMaterial(`iceMat_${def.id}`, this.scene);
-    iceMat.diffuseTexture = iceTex;
-    iceMat.specularColor = new Color3(0.3, 0.3, 0.4);
-    ice.material = iceMat;
-    ice.parent = systemRoot;
-    planetMeshes.push(ice);
-    orbitSystem.addBody({
-      mesh: ice,
-      orbitRadius: cfg.ice.orbitRadius,
-      orbitSpeed: cfg.ice.orbitSpeed,
-      currentAngle: Math.random() * Math.PI * 2,
-      axialRotationSpeed: 0.4,
-    });
-
-    // Start system hidden
-    starMesh.visibility = 0;
-    for (const p of planetMeshes) p.visibility = 0;
-
-    return {
-      def,
-      glowMesh,
-      systemRoot,
-      starMesh,
-      planetMeshes,
-      light,
-      orbitSystem,
-      systemVisible: false,
-    };
-  }
-
-  /* ─────────── Per-frame update ─────────── */
+  /* ─────────────────────── Per-frame ─────────────────────── */
 
   onBeforeRender(): void {
     const dt = this.engine.getDeltaTime() / 1000;
     const camTarget = this.cam.target;
     const camRadius = this.cam.radius;
+    const trans = GALAXY_MAP.transition;
 
-    // WASD / edge panning
+    // Camera panning (WASD / edge / bounds enforcement)
     this.cam.updatePanning(dt);
 
-    for (const rt of this.starRuntimes) {
-      // Distance from camera focus point to this star (XZ plane)
-      const dist = Vector3.Distance(
-        new Vector3(camTarget.x, 0, camTarget.z),
-        new Vector3(rt.def.position.x, 0, rt.def.position.z)
-      );
+    // ── Find nearest star to camera target ──
+    let nearestStar: StarData | null = null;
+    let nearestDistSq = Infinity;
+    for (const star of this.stars) {
+      const dx = camTarget.x - star.x;
+      const dz = camTarget.z - star.z;
+      const dSq = dx * dx + dz * dz;
+      if (dSq < nearestDistSq) {
+        nearestDistSq = dSq;
+        nearestStar = star;
+      }
+    }
+    const nearestDist = Math.sqrt(nearestDistSq);
 
-      const isFocused = dist < FOCUS_DIST;
+    // ── Determine if we're exiting (use wider thresholds) ──
+    // Once inside a system, use the more lenient "out" thresholds so
+    // the player has to zoom out 2-3x further to leave.
+    const isInSystem = this.lockedStarId >= 0 && this.blend > 0.01;
+    const activeFadeStart = isInSystem ? trans.systemFadeStartOut : trans.systemFadeStart;
+    const activeFadeEnd   = isInSystem ? trans.systemFadeEndOut   : trans.systemFadeEnd;
+    const activeFocusDist = isInSystem ? trans.focusDistanceOut   : trans.focusDistance;
 
-      // ── Compute blend factor: 0 = galaxy view, 1 = fully in system ──
-      let blend = 0;
-      if (isFocused) {
-        if (camRadius <= TRANSITION_END) {
-          blend = 1;
-        } else if (camRadius >= TRANSITION_START) {
-          blend = 0;
+    // ── Can we focus on the nearest star? ──
+    const canFocusNearest =
+      nearestStar !== null &&
+      nearestDist < activeFocusDist &&
+      camRadius < activeFadeStart;
+
+    // ── Target lock logic ──
+    // Once blend exceeds the lock threshold, the focused star is locked
+    // and won't change until the transition fully reverses (blend ≈ 0).
+    const isLocked = this.lockedStarId >= 0 && this.blend > trans.lockBlendThreshold;
+
+    let focusStar: StarData | null = null;
+    if (isLocked) {
+      // Stay locked on current star regardless of nearest
+      focusStar = this.stars[this.lockedStarId];
+    } else if (canFocusNearest && nearestStar) {
+      focusStar = nearestStar;
+    }
+
+    // ── Compute target blend (0 = galaxy view, 1 = fully in system) ──
+    let targetBlend = 0;
+    if (focusStar) {
+      // Distance from camera target to the focus star (for locked stars,
+      // this may differ from nearestDist)
+      const fdx = camTarget.x - focusStar.x;
+      const fdz = camTarget.z - focusStar.z;
+      const focusDist = Math.sqrt(fdx * fdx + fdz * fdz);
+
+      // Only blend in if camera is close enough to the focus star AND zoomed in
+      if (focusDist < activeFocusDist && camRadius < activeFadeStart) {
+        if (camRadius <= activeFadeEnd) {
+          targetBlend = 1;
         } else {
-          blend = 1 - (camRadius - TRANSITION_END) / (TRANSITION_START - TRANSITION_END);
+          targetBlend =
+            1 - (camRadius - activeFadeEnd) / (activeFadeStart - activeFadeEnd);
         }
       }
+    }
 
-      // Smooth the blend with a cubic curve for nicer feel
-      blend = blend * blend * (3 - 2 * blend);
+    // Smoothstep for nicer feel
+    targetBlend = targetBlend * targetBlend * (3 - 2 * targetBlend);
 
-      // ── Apply blend ──
+    // Smooth blend changes over time to prevent jarring transitions
+    const blendSpeed = 4.0; // how fast blend catches up
+    this.blend += (targetBlend - this.blend) * Math.min(1, blendSpeed * dt);
+    // Snap to exact values at extremes
+    if (this.blend < 0.005) this.blend = 0;
+    if (this.blend > 0.995) this.blend = 1;
 
-      // Glow: visible when blend=0, invisible when blend=1
-      const glowAlpha = 1 - blend;
-      (rt.glowMesh.material as StandardMaterial).alpha = glowAlpha;
-      rt.glowMesh.visibility = glowAlpha > 0.01 ? 1 : 0;
-      // Scale glow down as we zoom in for a shrinking-glow effect
-      const glowScale = 1 - blend * 0.5;
-      rt.glowMesh.scaling.setAll(glowScale);
+    // ── Update transition phase ──
+    this.updatePhase(focusStar);
 
-      // System: visible when blend > 0
-      rt.starMesh.visibility = blend;
-      for (const p of rt.planetMeshes) {
-        p.visibility = blend;
+    // ── Camera magnetization: gradually center on focused star ──
+    if (focusStar && this.blend > trans.magnetStartBlend) {
+      const magnetT = Math.min(1, trans.magnetStrength * dt);
+      // Strength ramps up with blend so it's subtle at start, strong when close
+      const strength = magnetT * this.blend;
+      const starPos = new Vector3(focusStar.x, 0, focusStar.z);
+      const current = this.cam.target;
+      current.x += (starPos.x - current.x) * strength;
+      current.z += (starPos.z - current.z) * strength;
+    }
+
+    // ── Reset star field overrides for this frame ──
+    this.starField.resetOverrides();
+
+    // ── Neighbor suppression ──
+    if (focusStar && this.blend > trans.suppressionStartBlend) {
+      // Smoothly ramp suppression from 0→1 based on blend
+      const suppRaw = (this.blend - trans.suppressionStartBlend)
+        / (1 - trans.suppressionStartBlend);
+      const suppTarget = Math.min(1, suppRaw);
+      // Smooth it to avoid flickering
+      this.suppressionBlend += (suppTarget - this.suppressionBlend) * Math.min(1, 5 * dt);
+
+      this.starField.suppressNeighbors(
+        focusStar.id,
+        trans.suppressionRadius,
+        this.suppressionBlend,
+        trans.suppressionMinAlpha,
+        trans.suppressionShrinkFactor,
+      );
+    } else {
+      this.suppressionBlend = 0;
+    }
+
+    // ── Focused star sprite: enlarge slightly then fade ──
+    if (focusStar) {
+      // Before system is visible, slightly enlarge the focus star glow
+      // to create a "pulling in" effect. Then fade as system appears.
+      const highlightScale = 1 + 0.3 * this.blend * (1 - this.blend) * 4; // peaks at blend=0.5
+      this.starField.setStarScale(focusStar.id, highlightScale);
+      // Fade the star sprite as system fades in
+      this.starField.setStarAlpha(focusStar.id, 1 - this.blend);
+    }
+
+    // Apply all visual overrides to star sprites
+    this.starField.applyVisuals();
+
+    // ── Build / swap / dispose active system ──
+    const wantedSystemId = focusStar && this.blend > 0 ? focusStar.id : -1;
+
+    if (wantedSystemId !== (this.activeSystem?.starId ?? -1)) {
+      // Need to build or swap system
+      if (wantedSystemId >= 0 && focusStar) {
+        // Dispose old system first
+        this.disposeActiveSystem();
+        this.buildSystem(focusStar);
+      } else if (wantedSystemId < 0) {
+        // Dispose system (zoomed out)
+        this.disposeActiveSystem();
       }
-      rt.light.intensity = blend * 2.5;
+    }
 
-      // Only run orbit sim for visible systems
-      if (blend > 0.01) {
-        rt.orbitSystem.update(dt);
-        rt.starMesh.rotation.y += 0.05 * dt;
-        rt.systemVisible = true;
+    // ── Update active system visibility + dynamic scale ──
+    if (this.activeSystem && focusStar) {
+      const sys = this.activeSystem;
+
+      // Fade system meshes in/out
+      sys.starMesh.visibility = this.blend;
+      for (const p of sys.planetMeshes) {
+        p.visibility = this.blend;
+      }
+      sys.light.intensity = this.blend * 2.5;
+
+      // ── Dynamic scale trick (spatial decoupling) ──
+      // System starts tiny (fitting inside the glow sprite) and smoothly
+      // expands to full scale as you zoom closer. This creates the illusion
+      // of diving into the system without any visible pop.
+      const entryScale = trans.systemScaleAtEntry;
+      const fullScaleR = trans.systemFullScaleRadius;
+      const fadeEndR = trans.systemFadeEnd;
+
+      let sysScale: number;
+      if (camRadius >= fadeEndR) {
+        // Still fading in — scale ramps from ~0 to entryScale with blend
+        sysScale = entryScale * this.blend;
+      } else if (camRadius <= fullScaleR) {
+        // Fully zoomed in — full scale
+        sysScale = 1.0;
       } else {
-        rt.systemVisible = false;
+        // Between fade-end and full-scale radius: interpolate entryScale → 1.0
+        const t = 1 - (camRadius - fullScaleR) / (fadeEndR - fullScaleR);
+        const eased = t * t * (3 - 2 * t); // smoothstep
+        sysScale = entryScale + (1.0 - entryScale) * eased;
       }
 
-      // Slow-rotate the glow
-      rt.glowMesh.rotation.y += 0.15 * dt;
+      sys.root.scaling.setAll(sysScale);
+      // Scale light range proportionally so illumination stays correct
+      sys.light.range = 50 * sysScale;
+
+      // Tick orbits only when visible
+      if (this.blend > 0.01) {
+        sys.orbitSystem.update(dt);
+        sys.starMesh.rotation.y += 0.05 * dt;
+      }
+    }
+
+    // ── System focus camera constraint ──
+    if (focusStar && this.blend > 0.05) {
+      this.cam.setSystemFocus(
+        new Vector3(focusStar.x, 0, focusStar.z),
+        trans.systemBorderRadius,
+        this.blend,
+      );
+    } else {
+      this.cam.clearSystemFocus();
     }
   }
 
-  dispose(): void {
-    for (const rt of this.starRuntimes) {
-      rt.orbitSystem.dispose();
+  /* ─────────────────── Phase management ─────────────────── */
+
+  private updatePhase(focusStar: StarData | null): void {
+    const prevPhase = this.phase;
+
+    if (this.blend <= 0) {
+      this.phase = TransitionPhase.GALAXY;
+      // Fully in galaxy — unlock target
+      this.lockedStarId = -1;
+    } else if (this.blend >= 1) {
+      this.phase = TransitionPhase.IN_SYSTEM;
+    } else if (this.blend > 0 && prevPhase === TransitionPhase.GALAXY) {
+      // Just started zooming in
+      this.phase = TransitionPhase.ZOOMING_IN;
+      if (focusStar) {
+        this.lockedStarId = focusStar.id;
+      }
+    } else if (prevPhase === TransitionPhase.IN_SYSTEM) {
+      // Started zooming out
+      this.phase = TransitionPhase.ZOOMING_OUT;
     }
+    // Otherwise maintain current phase (ZOOMING_IN or ZOOMING_OUT)
+
+    // Lock target on first zoom-in contact regardless of phase transitions
+    if (focusStar && this.lockedStarId < 0 && this.blend > GALAXY_MAP.transition.lockBlendThreshold) {
+      this.lockedStarId = focusStar.id;
+    }
+  }
+
+  /* ─────────────────── System building ─────────────────── */
+
+  private buildSystem(star: StarData): void {
+    const typeCfg = STAR_TYPES[star.type];
+
+    // Root transform at star's galaxy position
+    const root = new TransformNode(`sysRoot_${star.id}`, this.scene);
+    root.position.set(star.x, 0, star.z);
+
+    // ── Star surface mesh ──
+    const starMesh = MeshBuilder.CreateSphere(
+      `star_${star.id}`,
+      { diameter: typeCfg.systemDiameter, segments: 32 },
+      this.scene,
+    );
+    const starMat = new StandardMaterial(`starMat_${star.id}`, this.scene);
+    starMat.emissiveTexture = this.surfaceTex;
+    starMat.emissiveColor = new Color3(star.color[0], star.color[1], star.color[2]).scale(0.9);
+    starMat.diffuseColor = Color3.Black();
+    starMat.specularColor = Color3.Black();
+    starMat.disableLighting = true;
+    starMesh.material = starMat;
+    starMesh.parent = root;
+    starMesh.isPickable = false;
+    starMesh.visibility = 0;
+    this.glowLayer.addIncludedOnlyMesh(starMesh);
+
+    // ── Point light at star center ──
+    const light = new PointLight(`light_${star.id}`, Vector3.Zero(), this.scene);
+    light.parent = root;
+    light.intensity = 0;
+    light.diffuse = new Color3(star.color[0], star.color[1], star.color[2]);
+    light.specular = new Color3(0.8, 0.8, 0.8);
+    light.range = 50;
+
+    // ── Planets ──
+    const orbitSystem = new OrbitSystem();
+    const planetMeshes: Mesh[] = [];
+    const texMap: Record<string, Texture> = {
+      rocky: this.rockyTex,
+      gas: this.gasTex,
+      ice: this.iceTex,
+    };
+
+    for (let i = 0; i < star.system.planets.length; i++) {
+      const planet = star.system.planets[i];
+      const mesh = MeshBuilder.CreateSphere(
+        `planet_${star.id}_${i}`,
+        { diameter: planet.diameter, segments: 20 },
+        this.scene,
+      );
+      const mat = new StandardMaterial(`pMat_${star.id}_${i}`, this.scene);
+      mat.diffuseTexture = texMap[planet.type] ?? this.rockyTex;
+      mat.specularColor = new Color3(0.1, 0.1, 0.1);
+      mesh.material = mat;
+      mesh.parent = root;
+      mesh.visibility = 0;
+      planetMeshes.push(mesh);
+
+      orbitSystem.addBody({
+        mesh,
+        orbitRadius: planet.orbitRadius,
+        orbitSpeed: planet.orbitSpeed,
+        currentAngle: Math.random() * Math.PI * 2,
+        axialRotationSpeed: 0.2 + Math.random() * 0.3,
+      });
+    }
+
+    this.activeSystem = {
+      starId: star.id,
+      root,
+      starMesh,
+      planetMeshes,
+      light,
+      orbitSystem,
+    };
+  }
+
+  private disposeActiveSystem(): void {
+    if (!this.activeSystem) return;
+    const sys = this.activeSystem;
+    sys.orbitSystem.dispose();
+    sys.light.dispose();
+    for (const p of sys.planetMeshes) {
+      p.material?.dispose();
+      p.dispose();
+    }
+    sys.starMesh.material?.dispose();
+    sys.starMesh.dispose();
+    sys.root.dispose();
+    this.activeSystem = null;
+  }
+
+  /* ─────────────────── Disposal ─────────────────── */
+
+  dispose(): void {
+    this.disposeActiveSystem();
+    this.starField.dispose();
     this.cam.dispose();
     this.scene.dispose();
   }

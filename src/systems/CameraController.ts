@@ -10,14 +10,17 @@ export interface CameraConfig {
   upperRadiusLimit: number;
   lowerBetaLimit?: number;
   upperBetaLimit?: number;
-  wheelPrecision: number;
+  /** Percentage of radius per scroll tick (overrides wheelPrecision) */
+  wheelDeltaPercentage?: number;
+  wheelPrecision?: number;
   inertia: number;
 }
 
 /**
  * CameraController
  * ArcRotateCamera with WASD + mouse-edge panning on the XZ plane.
- * Scroll wheel zooms in/out. Right-click drag to orbit.
+ * Scroll wheel zooms in/out (exponential). Right-click drag to orbit.
+ * Supports galaxy bounds clamping and system-focus border constraints.
  */
 export class CameraController {
   public camera: ArcRotateCamera;
@@ -26,10 +29,22 @@ export class CameraController {
 
   // WASD / edge pan state
   private keysDown = new Set<string>();
-  private panSpeed = 40;        // units per second at max zoom-out
+  private panSpeed = 60;        // units per second at max zoom-out
   private edgeThreshold = 40;   // pixels from screen edge
+  private rotateSpeed = 1.5;    // radians per second for Q/E orbit
   private mouseX = 0;
   private mouseY = 0;
+
+  // Galaxy bounds (default: unbounded)
+  private boundsMinX = -Infinity;
+  private boundsMaxX = Infinity;
+  private boundsMinZ = -Infinity;
+  private boundsMaxZ = Infinity;
+
+  // System focus constraint
+  private _focusCenter: Vector3 | null = null;
+  private _focusRadius = 0;
+  private _focusStrength = 0; // 0 = no constraint, 1 = hard clamp
 
   // bound handlers for cleanup
   private _onMouseMove: (e: MouseEvent) => void;
@@ -44,7 +59,7 @@ export class CameraController {
       config.beta,
       config.radius,
       config.target.clone(),
-      scene
+      scene,
     );
 
     this.camera.attachControl(canvas, true);
@@ -60,7 +75,13 @@ export class CameraController {
       this.camera.upperBetaLimit = config.upperBetaLimit;
     }
 
-    this.camera.wheelPrecision = config.wheelPrecision;
+    // Exponential zoom (percentage per tick) or linear zoom
+    if (config.wheelDeltaPercentage !== undefined) {
+      this.camera.wheelDeltaPercentage = config.wheelDeltaPercentage;
+    } else if (config.wheelPrecision !== undefined) {
+      this.camera.wheelPrecision = config.wheelPrecision;
+    }
+
     this.camera.inertia = config.inertia;
 
     // Disable panning via right-click drag — we handle our own panning
@@ -94,6 +115,8 @@ export class CameraController {
     canvas.addEventListener("mousemove", this._onMouseMove);
   }
 
+  /* ─── Accessors ─── */
+
   get radius(): number {
     return this.camera.radius;
   }
@@ -102,21 +125,53 @@ export class CameraController {
     return this.camera.target;
   }
 
+  /* ─── Bounds ─── */
+
+  /** Set the galaxy-level panning bounds (XZ plane). */
+  setBounds(minX: number, maxX: number, minZ: number, maxZ: number): void {
+    this.boundsMinX = minX;
+    this.boundsMaxX = maxX;
+    this.boundsMinZ = minZ;
+    this.boundsMaxZ = maxZ;
+  }
+
+  /* ─── System focus constraint ─── */
+
+  /**
+   * Set a soft border around a star system.
+   * @param center  World position of the star.
+   * @param radius  Max panning distance from center when strength=1.
+   * @param strength 0–1 blend: 0=no constraint, 1=hard clamp at radius.
+   */
+  setSystemFocus(center: Vector3, radius: number, strength: number): void {
+    this._focusCenter = center;
+    this._focusRadius = radius;
+    this._focusStrength = strength;
+  }
+
+  /** Release the system-focus border constraint. */
+  clearSystemFocus(): void {
+    this._focusCenter = null;
+    this._focusStrength = 0;
+  }
+
+  /* ─── Per-frame update ─── */
+
   /**
    * Call each frame with dt in seconds.
-   * Handles WASD + mouse-edge panning on the XZ plane.
+   * Handles WASD + mouse-edge panning, then enforces constraints.
    */
   updatePanning(dt: number): void {
     // Scale pan speed: faster when zoomed out, slower when zoomed in
-    const radiusFactor = this.camera.radius / (this.camera.upperRadiusLimit ?? 300);
+    const radiusFactor = this.camera.radius / (this.camera.upperRadiusLimit ?? 800);
     const speed = this.panSpeed * radiusFactor;
 
-    let dx = 0;
-    let dz = 0;
+    let dx = 0; // positive = right
+    let dz = 0; // positive = forward
 
-    // WASD
-    if (this.keysDown.has("w") || this.keysDown.has("arrowup")) dz -= 1;
-    if (this.keysDown.has("s") || this.keysDown.has("arrowdown")) dz += 1;
+    // WASD — W forward, S backward, A left, D right
+    if (this.keysDown.has("w") || this.keysDown.has("arrowup")) dz += 1;
+    if (this.keysDown.has("s") || this.keysDown.has("arrowdown")) dz -= 1;
     if (this.keysDown.has("a") || this.keysDown.has("arrowleft")) dx -= 1;
     if (this.keysDown.has("d") || this.keysDown.has("arrowright")) dx += 1;
 
@@ -127,54 +182,56 @@ export class CameraController {
 
     if (this.mouseX < et) dx -= 1;
     if (this.mouseX > w - et) dx += 1;
-    if (this.mouseY < et) dz -= 1;
-    if (this.mouseY > h - et) dz += 1;
+    if (this.mouseY < et) dz += 1;
+    if (this.mouseY > h - et) dz -= 1;
 
-    if (dx === 0 && dz === 0) return;
+    if (dx !== 0 || dz !== 0) {
+      // Normalize if diagonal
+      const len = Math.sqrt(dx * dx + dz * dz);
+      dx /= len;
+      dz /= len;
 
-    // Normalize if diagonal
-    const len = Math.sqrt(dx * dx + dz * dz);
-    dx /= len;
-    dz /= len;
+      // Camera-relative directions on XZ plane
+      const forward = this.camera.getForwardRay().direction;
+      const fwd = new Vector3(forward.x, 0, forward.z).normalize();
+      const right = new Vector3(-fwd.z, 0, fwd.x); // perpendicular right
 
-    // Get camera forward direction projected onto XZ
-    const forward = this.camera.getForwardRay().direction;
-    const fwd = new Vector3(forward.x, 0, forward.z).normalize();
-    const right = new Vector3(fwd.z, 0, -fwd.x); // perpendicular on XZ
+      const move = fwd.scale(dz * speed * dt).add(right.scale(dx * speed * dt));
+      this.camera.target.addInPlace(move);
+    }
 
-    const move = fwd.scale(dz * speed * dt).add(right.scale(dx * speed * dt));
-    // We move in camera-relative XZ, but the panning should feel like
-    // "screen-space" directions, so we negate to make W = forward
-    this.camera.target.addInPlace(move.scale(-1));
-  }
+    // ── Q / E — orbit camera horizontally around target ──
+    if (this.keysDown.has("q")) {
+      this.camera.alpha -= this.rotateSpeed * dt;
+    }
+    if (this.keysDown.has("e")) {
+      this.camera.alpha += this.rotateSpeed * dt;
+    }
 
-  /**
-   * Smoothly animate both target and radius simultaneously.
-   */
-  animateTargetAndRadius(targetPos: Vector3, targetRadius: number, duration: number): Promise<void> {
-    return new Promise((resolve) => {
-      const startPos = this.camera.target.clone();
-      const startRadius = this.camera.radius;
-      const startTime = performance.now();
-      const durationMs = duration * 1000;
+    // ── Enforce system focus constraint ──
+    if (this._focusCenter && this._focusStrength > 0.01) {
+      const cx = this._focusCenter.x;
+      const cz = this._focusCenter.z;
+      const offX = this.camera.target.x - cx;
+      const offZ = this.camera.target.z - cz;
+      const dist = Math.sqrt(offX * offX + offZ * offZ);
+      const maxDist = this._focusRadius;
 
-      const step = (now: number) => {
-        const elapsed = now - startTime;
-        const t = Math.min(elapsed / durationMs, 1);
-        const eased = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
-        this.camera.target = Vector3.Lerp(startPos, targetPos, eased);
-        this.camera.radius = startRadius + (targetRadius - startRadius) * eased;
+      if (dist > maxDist) {
+        // Pull back proportional to strength
+        // At strength=1, hard clamp at maxDist
+        // At strength<1, allow exceeding but pull back partially
+        const targetDist = maxDist + (dist - maxDist) * (1 - this._focusStrength);
+        const scale = targetDist / dist;
+        this.camera.target.x = cx + offX * scale;
+        this.camera.target.z = cz + offZ * scale;
+      }
+    }
 
-        if (t < 1) {
-          requestAnimationFrame(step);
-        } else {
-          this.camera.target = targetPos.clone();
-          this.camera.radius = targetRadius;
-          resolve();
-        }
-      };
-      requestAnimationFrame(step);
-    });
+    // ── Enforce galaxy bounds ──
+    this.camera.target.x = Math.max(this.boundsMinX, Math.min(this.boundsMaxX, this.camera.target.x));
+    this.camera.target.z = Math.max(this.boundsMinZ, Math.min(this.boundsMaxZ, this.camera.target.z));
+    this.camera.target.y = 0; // always on galaxy plane
   }
 
   dispose(): void {

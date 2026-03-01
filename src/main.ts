@@ -1,6 +1,5 @@
 import { SceneManager } from "./SceneManager";
 import { GalaxyScene } from "./scenes/GalaxyScene";
-import { TransitionController } from "./systems/TransitionController";
 
 async function boot() {
   const canvas = document.getElementById("renderCanvas") as HTMLCanvasElement;
@@ -12,11 +11,7 @@ async function boot() {
   const galaxy = new GalaxyScene(engine);
   await mgr.startScene(galaxy);
 
-  // Quick fade-in to reveal the galaxy
-  const transition = new TransitionController();
-  transition.fadeIn(1.2);
-
-  console.log("🚀 Space Strategy prototype running");
+  console.log("Space Strategy prototype running");
 }
 
 boot().catch(console.error);
