@@ -50,6 +50,8 @@ export class SystemScene implements IGameScene {
   private orbitRings: LinesMesh[] = [];
   private isExiting = false;
   private elapsed = 0;
+  private starsVisible = true;
+  private bloomEnabled = true;
 
   private starKind: StarVisualKind = "main-sequence";
 
@@ -107,6 +109,8 @@ export class SystemScene implements IGameScene {
     this.setupCamera(canvas);
     this.setupLighting();
     this.buildSystemObjects();
+    this.setStarsVisible(this.starsVisible);
+    this.setBloomEnabled(this.bloomEnabled);
 
     window.addEventListener("keydown", this.onEscapeKey);
     await this.scene.whenReadyAsync();
@@ -162,6 +166,10 @@ export class SystemScene implements IGameScene {
     } else {
       this.glowLayer.intensity =
         this.glowBaseIntensity + this.glowPulseAmplitude * Math.sin(this.elapsed * this.glowPulseSpeed);
+    }
+
+    if (!this.bloomEnabled) {
+      this.glowLayer.intensity = 0;
     }
   }
 
@@ -920,6 +928,24 @@ export class SystemScene implements IGameScene {
       .finally(() => {
         this.isExiting = false;
       });
+  }
+
+  getStar(): StarData {
+    return this.star;
+  }
+
+  setStarsVisible(visible: boolean): void {
+    this.starsVisible = visible;
+    if (this.starMesh) {
+      this.starMesh.setEnabled(visible);
+    }
+  }
+
+  setBloomEnabled(enabled: boolean): void {
+    this.bloomEnabled = enabled;
+    if (this.glowLayer) {
+      this.glowLayer.intensity = enabled ? this.glowLayer.intensity : 0;
+    }
   }
 
   dispose(): void {

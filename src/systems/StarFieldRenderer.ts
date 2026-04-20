@@ -149,6 +149,8 @@ export class StarFieldRenderer {
 
   private zoomOutBlend = 1;
   private elapsedTime = 0;
+  private starsVisible = true;
+  private bloomEnabled = true;
 
   constructor(scene: Scene, stars: StarData[]) {
     const haloTexture = createRadialTextureDataURL(
@@ -367,6 +369,14 @@ export class StarFieldRenderer {
     this.zoomOutBlend = clamp01(zoomOutBlend);
   }
 
+  setStarsVisible(visible: boolean): void {
+    this.starsVisible = visible;
+  }
+
+  setBloomEnabled(enabled: boolean): void {
+    this.bloomEnabled = enabled;
+  }
+
   /**
    * Suppress (fade + shrink) all stars within `radius` of the focus star.
    * @param focusStarId  The star being zoomed into (excluded from suppression).
@@ -427,6 +437,8 @@ export class StarFieldRenderer {
     const haloScaleBoost = mix(1.0, 1.65, this.zoomOutBlend);
     const coreAlphaBoost = mix(0.95, 1.35, this.zoomOutBlend);
     const haloAlphaBoost = mix(1.0, 1.65, this.zoomOutBlend);
+    const starsVisibilityAlpha = this.starsVisible ? 1 : 0;
+    const bloomVisibilityAlpha = this.bloomEnabled ? 1 : 0;
 
     for (let i = 0; i < this.coreSprites.length; i++) {
       const base = this.baseColors[i];
@@ -456,13 +468,20 @@ export class StarFieldRenderer {
         base.r,
         base.g,
         base.b,
-        clamp01(this.coreBaseAlphas[i] * a * coreAlphaBoost * alphaPulse),
+        clamp01(this.coreBaseAlphas[i] * a * coreAlphaBoost * alphaPulse * starsVisibilityAlpha),
       );
       halo.color.set(
         base.r,
         base.g,
         base.b,
-        clamp01(this.haloBaseAlphas[i] * a * haloAlphaBoost * alphaPulse),
+        clamp01(
+          this.haloBaseAlphas[i]
+          * a
+          * haloAlphaBoost
+          * alphaPulse
+          * starsVisibilityAlpha
+          * bloomVisibilityAlpha,
+        ),
       );
     }
   }

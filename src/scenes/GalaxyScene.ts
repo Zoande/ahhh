@@ -48,13 +48,263 @@ function mulberry32(seed: number): () => number {
   };
 }
 
-type CoreTextureShape = {
+const TAU = Math.PI * 2;
+const HYPERLANE_MIN_CONNECTIONS = 2;
+const HYPERLANE_MAX_CONNECTIONS = 3;
+const HYPERLANE_BASE_VISIBILITY = 0.052;
+const HYPERLANE_ZOOM_VISIBILITY_BOOST = 0.15;
+const HYPERLANE_BASE_ALPHA = 0.011;
+const HYPERLANE_DISTANCE_ALPHA_BOOST = 0.026;
+const HYPERLANE_ENDPOINT_ALPHA_FACTOR = 0.14;
+const HYPERLANE_STAR_ENDPOINT_OFFSET_FACTOR = 0.2;
+const HYPERLANE_STAR_ENDPOINT_OFFSET_MIN = 4;
+const HYPERLANE_STAR_ENDPOINT_OFFSET_MAX = 10;
+
+function clamp(v: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, v));
+}
+
+function normalizeAngle(angle: number): number {
+  let a = angle % TAU;
+  if (a < 0) a += TAU;
+  return a;
+}
+
+function shortestAngleDiff(a: number, b: number): number {
+  const d = Math.abs(a - b) % TAU;
+  return d > Math.PI ? TAU - d : d;
+}
+
+export type CoreTextureShape = {
   innerRadiusFraction: number;
   outerRadiusFraction: number;
   spiralArms: number;
   spiralTightness: number;
   armSpread: number;
 };
+
+type StarArmMeta = {
+  armIndex: number;
+  spiralPhase: number;
+  normalizedR: number;
+};
+
+type HyperlaneCandidate = {
+  index: number;
+  distance: number;
+  score: number;
+  sameArm: boolean;
+};
+
+function buildStarArmMetadata(
+  stars: StarData[],
+  width: number,
+  height: number,
+  shape: CoreTextureShape,
+): StarArmMeta[] {
+  const minAxis = Math.min(width, height);
+  const xScale = width / minAxis;
+  const zScale = height / minAxis;
+  const halfSize = minAxis / 2;
+  const innerR = halfSize * shape.innerRadiusFraction;
+  const outerR = halfSize * shape.outerRadiusFraction;
+  const radialSpan = Math.max(0.0001, outerR - innerR);
+  const armCount = Math.max(0, Math.floor(shape.spiralArms));
+  const armSector = armCount > 0 ? TAU / armCount : TAU;
+
+  const metadata: StarArmMeta[] = [];
+  for (const star of stars) {
+    const nx = star.x / xScale;
+    const nz = star.z / zScale;
+    const r = Math.hypot(nx, nz);
+    const theta = Math.atan2(nz, nx);
+    const normalizedR = clamp((r - innerR) / radialSpan, 0, 1);
+    const twist = normalizedR * shape.spiralTightness * Math.PI;
+    const spiralPhase = normalizeAngle(theta - twist);
+
+    let armIndex = 0;
+    if (armCount > 0) {
+      armIndex = Math.round(spiralPhase / armSector) % armCount;
+      if (armIndex < 0) armIndex += armCount;
+    }
+
+    metadata.push({ armIndex, spiralPhase, normalizedR });
+  }
+
+  return metadata;
+}
+
+export function buildHyperlanePairs(
+  stars: StarData[],
+  width: number,
+  height: number,
+  shape: CoreTextureShape,
+  seed: number,
+): Array<[number, number]> {
+  if (stars.length < 2) return [];
+
+  const rng = mulberry32(seed ^ 0x9e3779b1);
+  const armCount = Math.max(0, Math.floor(shape.spiralArms));
+  const starMeta = buildStarArmMetadata(stars, width, height, shape);
+
+  const minAxis = Math.min(width, height);
+  const maxCandidateDistance = minAxis * 0.34;
+  const minBridgeDistance = minAxis * 0.1;
+  const candidatePoolSize = 26;
+
+  const candidates: HyperlaneCandidate[][] = Array.from({ length: stars.length }, () => []);
+
+  for (let i = 0; i < stars.length; i++) {
+    const localCandidates: HyperlaneCandidate[] = [];
+    for (let j = 0; j < stars.length; j++) {
+      if (i === j) continue;
+
+      const dx = stars[j].x - stars[i].x;
+      const dz = stars[j].z - stars[i].z;
+      const distance = Math.hypot(dx, dz);
+      if (distance > maxCandidateDistance) continue;
+
+      const sameArm = armCount > 0 && starMeta[i].armIndex === starMeta[j].armIndex;
+      const radialDelta = Math.abs(starMeta[i].normalizedR - starMeta[j].normalizedR);
+      const spiralDelta = shortestAngleDiff(starMeta[i].spiralPhase, starMeta[j].spiralPhase);
+
+      let score = distance;
+      if (armCount > 0) {
+        if (sameArm) {
+          score *= 0.78 + radialDelta * 0.32;
+          score *= 1 + (spiralDelta / Math.PI) * 0.18;
+        } else {
+          score *= 1.18 + Math.max(0, 0.1 - radialDelta) * 0.6;
+          score *= 1 + ((Math.PI - spiralDelta) / Math.PI) * 0.08;
+        }
+      }
+
+      localCandidates.push({ index: j, distance, score, sameArm });
+    }
+
+    if (localCandidates.length === 0) {
+      for (let j = 0; j < stars.length; j++) {
+        if (i === j) continue;
+        const dx = stars[j].x - stars[i].x;
+        const dz = stars[j].z - stars[i].z;
+        localCandidates.push({
+          index: j,
+          distance: Math.hypot(dx, dz),
+          score: Math.hypot(dx, dz),
+          sameArm: armCount > 0 && starMeta[i].armIndex === starMeta[j].armIndex,
+        });
+      }
+    }
+
+    localCandidates.sort((a, b) => {
+      if (a.score !== b.score) return a.score - b.score;
+      return a.distance - b.distance;
+    });
+    candidates[i] = localCandidates.slice(0, candidatePoolSize);
+  }
+
+  const degree = new Uint8Array(stars.length);
+  const targetDegree = new Uint8Array(stars.length);
+  for (let i = 0; i < stars.length; i++) {
+    targetDegree[i] = rng() < 0.42 ? 3 : 2;
+  }
+
+  const edges = new Set<string>();
+  const hyperlanes: Array<[number, number]> = [];
+
+  const edgeKey = (a: number, b: number): string => {
+    const x = Math.min(a, b);
+    const y = Math.max(a, b);
+    return `${x}:${y}`;
+  };
+
+  const connect = (a: number, b: number): boolean => {
+    if (a === b) return false;
+    if (degree[a] >= HYPERLANE_MAX_CONNECTIONS || degree[b] >= HYPERLANE_MAX_CONNECTIONS) {
+      return false;
+    }
+
+    const key = edgeKey(a, b);
+    if (edges.has(key)) return false;
+
+    edges.add(key);
+    degree[a] += 1;
+    degree[b] += 1;
+    hyperlanes.push([Math.min(a, b), Math.max(a, b)]);
+    return true;
+  };
+
+  // Pass 1: ensure each star reaches at least 2 links where possible.
+  for (let pass = 0; pass < HYPERLANE_MIN_CONNECTIONS; pass++) {
+    for (let i = 0; i < stars.length; i++) {
+      while (degree[i] <= pass && degree[i] < HYPERLANE_MIN_CONNECTIONS) {
+        const candidate = candidates[i].find((c) => {
+          if (degree[c.index] >= HYPERLANE_MAX_CONNECTIONS) return false;
+          return !edges.has(edgeKey(i, c.index));
+        });
+        if (!candidate) break;
+        connect(i, candidate.index);
+      }
+    }
+  }
+
+  // Pass 2: fill some stars to 3 links, mostly preserving lane structure.
+  for (let i = 0; i < stars.length; i++) {
+    if (degree[i] >= targetDegree[i]) continue;
+
+    const candidate = candidates[i].find((c) => {
+      if (degree[c.index] >= HYPERLANE_MAX_CONNECTIONS) return false;
+      if (edges.has(edgeKey(i, c.index))) return false;
+      return c.sameArm || rng() < 0.24;
+    });
+
+    if (candidate) connect(i, candidate.index);
+  }
+
+  // Pass 3: occasional inter-arm bridges to create cross-lane navigation.
+  if (armCount > 1) {
+    for (let i = 0; i < stars.length; i++) {
+      if (degree[i] >= HYPERLANE_MAX_CONNECTIONS) continue;
+      if (rng() > 0.18) continue;
+
+      const bridge = candidates[i].find((c) => {
+        if (c.sameArm) return false;
+        if (c.distance < minBridgeDistance) return false;
+        if (degree[c.index] >= HYPERLANE_MAX_CONNECTIONS) return false;
+        return !edges.has(edgeKey(i, c.index));
+      });
+
+      if (bridge) connect(i, bridge.index);
+    }
+  }
+
+  // Final rescue: try to pull low-degree stars up to 2 links.
+  for (let i = 0; i < stars.length; i++) {
+    while (degree[i] < HYPERLANE_MIN_CONNECTIONS) {
+      const candidate = candidates[i].find((c) => {
+        if (degree[c.index] >= HYPERLANE_MAX_CONNECTIONS) return false;
+        return !edges.has(edgeKey(i, c.index));
+      });
+      if (!candidate) break;
+      connect(i, candidate.index);
+    }
+  }
+
+  return hyperlanes;
+}
+
+export function buildHyperlaneAdjacency(
+  hyperlanes: Array<[number, number]>,
+  starCount: number,
+): number[][] {
+  const adjacency: number[][] = Array.from({ length: starCount }, () => []);
+  for (const [a, b] of hyperlanes) {
+    if (a < 0 || b < 0 || a >= starCount || b >= starCount) continue;
+    adjacency[a].push(b);
+    adjacency[b].push(a);
+  }
+  return adjacency;
+}
 
 function createGalacticCoreTextureDataURL(
   size: number,
@@ -323,8 +573,19 @@ export class GalaxyScene implements IGameScene {
   private starField!: StarFieldRenderer;
   private stars: StarData[] = [];
   private clickPlane!: Mesh;
+  private hyperlaneMesh: Mesh | null = null;
+  private hyperlanePairs: Array<[number, number]> = [];
+  private hyperlaneAdjacency: number[][] = [];
   private galacticCoreMeshes: Mesh[] = [];
   private galacticCoreSpinSpeeds: number[] = [];
+  private hoveredStarId = -1;
+  private readonly hoverScaleBoost = 1.3;
+
+  private hyperlanesVisible = true;
+  private centerCloudVisible = true;
+  private starsVisible = true;
+  private bloomEnabled = true;
+
   private pointerObserver: Observer<PointerInfo> | null = null;
   private isNavigating = false;
   private readonly onEnterSystem: EnterSystemHandler;
@@ -332,6 +593,10 @@ export class GalaxyScene implements IGameScene {
 
   private readonly onContextMenu = (ev: MouseEvent): void => {
     ev.preventDefault();
+  };
+
+  private readonly onCanvasPointerLeave = (): void => {
+    this.hoveredStarId = -1;
   };
 
   constructor(
@@ -349,6 +614,7 @@ export class GalaxyScene implements IGameScene {
   async setup(): Promise<void> {
     this.canvas = this.engine.getRenderingCanvas()!;
     this.canvas.addEventListener("contextmenu", this.onContextMenu);
+    this.canvas.addEventListener("mouseleave", this.onCanvasPointerLeave);
 
     const cfg = GALAXY_MAP;
     this.stars =
@@ -413,10 +679,16 @@ export class GalaxyScene implements IGameScene {
     bgSphere.infiniteDistance = true;
 
     this.setupGalacticCore(cfg.width, cfg.height);
+    this.setupHyperlanes(cfg.width, cfg.height, cfg.shape, cfg.seed);
 
     this.starField = new StarFieldRenderer(this.scene, this.stars);
 
     this.pointerObserver = this.scene.onPointerObservable.add((pointerInfo) => {
+      if (pointerInfo.type === PointerEventTypes.POINTERMOVE) {
+        this.updateHoveredStarFromPointer();
+        return;
+      }
+
       if (pointerInfo.type !== PointerEventTypes.POINTERDOWN) return;
       const ev = pointerInfo.event as PointerEvent;
       if (ev.button !== 0) return;
@@ -439,12 +711,96 @@ export class GalaxyScene implements IGameScene {
 
     this.starField.update(dt);
     this.starField.resetOverrides();
+    if (this.hoveredStarId >= 0 && this.hoveredStarId < this.stars.length) {
+      this.starField.setStarScale(this.hoveredStarId, this.hoverScaleBoost);
+    }
     this.starField.setZoomOutBlend(zoomOutBlend);
+    this.starField.setStarsVisible(this.starsVisible);
+    this.starField.setBloomEnabled(this.bloomEnabled);
     this.starField.applyVisuals();
 
+    if (this.hyperlaneMesh) {
+      this.hyperlaneMesh.visibility = this.hyperlanesVisible
+        ? HYPERLANE_BASE_VISIBILITY + zoomOutBlend * HYPERLANE_ZOOM_VISIBILITY_BOOST
+        : 0;
+    }
+
     for (let i = 0; i < this.galacticCoreMeshes.length; i++) {
+      this.galacticCoreMeshes[i].setEnabled(this.centerCloudVisible);
       this.galacticCoreMeshes[i].rotation.y += this.galacticCoreSpinSpeeds[i] * dt;
     }
+  }
+
+  private setupHyperlanes(
+    width: number,
+    height: number,
+    shape: CoreTextureShape,
+    seed: number,
+  ): void {
+    const hyperlanes = buildHyperlanePairs(this.stars, width, height, shape, seed);
+    this.hyperlanePairs = hyperlanes;
+    this.hyperlaneAdjacency = buildHyperlaneAdjacency(hyperlanes, this.stars.length);
+    if (hyperlanes.length === 0) return;
+
+    const minAxis = Math.min(width, height);
+    const maxLaneDistance = minAxis * 0.34;
+    const lineSegments: Vector3[][] = [];
+    const lineColors: Color4[][] = [];
+
+    for (const [a, b] of hyperlanes) {
+      const starA = this.stars[a];
+      const starB = this.stars[b];
+
+      const dx = starB.x - starA.x;
+      const dz = starB.z - starA.z;
+      const distance = Math.hypot(dx, dz);
+      if (distance < 0.0001) continue;
+
+      const endpointInset = clamp(
+        distance * HYPERLANE_STAR_ENDPOINT_OFFSET_FACTOR,
+        HYPERLANE_STAR_ENDPOINT_OFFSET_MIN,
+        HYPERLANE_STAR_ENDPOINT_OFFSET_MAX,
+      );
+
+      const ux = dx / distance;
+      const uz = dz / distance;
+      const ax = starA.x + ux * endpointInset;
+      const az = starA.z + uz * endpointInset;
+      const bx = starB.x - ux * endpointInset;
+      const bz = starB.z - uz * endpointInset;
+      const mx = (ax + bx) * 0.5;
+      const mz = (az + bz) * 0.5;
+
+      const shortLaneFactor = 1 - clamp(distance / maxLaneDistance, 0, 1);
+      const midAlpha = HYPERLANE_BASE_ALPHA + shortLaneFactor * HYPERLANE_DISTANCE_ALPHA_BOOST;
+      const endAlpha = midAlpha * HYPERLANE_ENDPOINT_ALPHA_FACTOR;
+
+      const laneColorStart = new Color4(0.53, 0.57, 0.62, endAlpha);
+      const laneColorMid = new Color4(0.56, 0.61, 0.67, midAlpha);
+      const laneColorEnd = new Color4(0.53, 0.57, 0.62, endAlpha);
+
+      lineSegments.push([
+        new Vector3(ax, 0.06, az),
+        new Vector3(mx, 0.06, mz),
+        new Vector3(bx, 0.06, bz),
+      ]);
+      lineColors.push([laneColorStart, laneColorMid, laneColorEnd]);
+    }
+
+    this.hyperlaneMesh = MeshBuilder.CreateLineSystem(
+      "galaxyHyperlanes",
+      {
+        lines: lineSegments,
+        colors: lineColors,
+        updatable: false,
+      },
+      this.scene,
+    );
+    this.hyperlaneMesh.isPickable = false;
+    this.hyperlaneMesh.alwaysSelectAsActiveMesh = true;
+    this.hyperlaneMesh.visibility = this.hyperlanesVisible
+      ? HYPERLANE_BASE_VISIBILITY + HYPERLANE_ZOOM_VISIBILITY_BOOST
+      : 0;
   }
 
   private setupGalacticCore(width: number, height: number): void {
@@ -562,7 +918,7 @@ export class GalaxyScene implements IGameScene {
     }
   }
 
-  private tryEnterSystemAtPointer(): void {
+  private findNearestStarAtPointer(): StarData | null {
     const pick = this.scene.pick(
       this.scene.pointerX,
       this.scene.pointerY,
@@ -571,7 +927,7 @@ export class GalaxyScene implements IGameScene {
       this.cam.camera,
     );
 
-    if (!pick?.hit || !pick.pickedPoint) return;
+    if (!pick?.hit || !pick.pickedPoint) return null;
 
     const clickX = pick.pickedPoint.x;
     const clickZ = pick.pickedPoint.z;
@@ -591,7 +947,18 @@ export class GalaxyScene implements IGameScene {
       }
     }
 
-    if (!nearestStar || nearestDistSq > pickRadiusSq) return;
+    if (!nearestStar || nearestDistSq > pickRadiusSq) return null;
+    return nearestStar;
+  }
+
+  private updateHoveredStarFromPointer(): void {
+    const hovered = this.findNearestStarAtPointer();
+    this.hoveredStarId = hovered ? hovered.id : -1;
+  }
+
+  private tryEnterSystemAtPointer(): void {
+    const nearestStar = this.findNearestStarAtPointer();
+    if (!nearestStar) return;
     this.requestEnterSystem(nearestStar);
   }
 
@@ -607,6 +974,41 @@ export class GalaxyScene implements IGameScene {
 
   getStars(): StarData[] {
     return this.stars;
+  }
+
+  getConnectedStars(starId: number): StarData[] {
+    if (starId < 0 || starId >= this.hyperlaneAdjacency.length) return [];
+    const neighborIds = this.hyperlaneAdjacency[starId] ?? [];
+    const out: StarData[] = [];
+    for (const neighborId of neighborIds) {
+      const star = this.stars[neighborId];
+      if (star) out.push(star);
+    }
+    return out;
+  }
+
+  setHyperlanesVisible(visible: boolean): void {
+    this.hyperlanesVisible = visible;
+    if (this.hyperlaneMesh) {
+      this.hyperlaneMesh.visibility = visible
+        ? HYPERLANE_BASE_VISIBILITY + HYPERLANE_ZOOM_VISIBILITY_BOOST
+        : 0;
+    }
+  }
+
+  setCenterCloudVisible(visible: boolean): void {
+    this.centerCloudVisible = visible;
+    for (const mesh of this.galacticCoreMeshes) {
+      mesh.setEnabled(visible);
+    }
+  }
+
+  setStarsVisible(visible: boolean): void {
+    this.starsVisible = visible;
+  }
+
+  setBloomEnabled(enabled: boolean): void {
+    this.bloomEnabled = enabled;
   }
 
   captureViewState(): GalaxyViewState | null {
@@ -629,6 +1031,12 @@ export class GalaxyScene implements IGameScene {
       this.pointerObserver = null;
     }
     this.canvas?.removeEventListener("contextmenu", this.onContextMenu);
+    this.canvas?.removeEventListener("mouseleave", this.onCanvasPointerLeave);
+    this.hyperlaneMesh?.dispose();
+    this.hyperlaneMesh = null;
+    this.hyperlanePairs = [];
+    this.hyperlaneAdjacency = [];
+    this.hoveredStarId = -1;
     this.galacticCoreMeshes = [];
     this.galacticCoreSpinSpeeds = [];
     this.clickPlane?.dispose();
