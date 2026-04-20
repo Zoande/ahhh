@@ -11,6 +11,8 @@ export interface IGameScene {
 export class SceneManager {
   private engine!: AbstractEngine;
   private activeScene: IGameScene | null = null;
+  private isRenderLoopRunning = false;
+  private resizeHandler: (() => void) | null = null;
 
   async initEngine(canvas: HTMLCanvasElement): Promise<AbstractEngine> {
     let engine: AbstractEngine;
@@ -25,7 +27,8 @@ export class SceneManager {
     }
     this.engine = engine;
 
-    window.addEventListener("resize", () => engine.resize());
+    this.resizeHandler = () => engine.resize();
+    window.addEventListener("resize", this.resizeHandler);
     return engine;
   }
 
@@ -41,15 +44,25 @@ export class SceneManager {
     this.activeScene = gs;
     await gs.setup();
 
-    gs.scene.registerBeforeRender(() => gs.onBeforeRender());
-
-    this.engine.runRenderLoop(() => {
-      gs.scene.render();
-    });
+    if (!this.isRenderLoopRunning) {
+      this.engine.runRenderLoop(() => {
+        const active = this.activeScene;
+        if (!active) return;
+        active.onBeforeRender();
+        active.scene.render();
+      });
+      this.isRenderLoopRunning = true;
+    }
   }
 
   dispose(): void {
     this.activeScene?.dispose();
+    this.activeScene = null;
+    if (this.resizeHandler) {
+      window.removeEventListener("resize", this.resizeHandler);
+      this.resizeHandler = null;
+    }
+    this.engine.stopRenderLoop();
     this.engine.dispose();
   }
 }

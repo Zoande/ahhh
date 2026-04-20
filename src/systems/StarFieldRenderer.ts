@@ -8,26 +8,76 @@
  * Supports:
  * - Per-star alpha for smooth transitions
  * - Per-star scale for highlight / shrink effects
- * - Neighbor suppression: fade + shrink nearby stars during system focus
- * - Batch restore for reverse transitions
+ * - Type-specific color/size styling
+ * - Type-specific pulse behavior (notably pulsars)
  */
 
 import { SpriteManager, Sprite, Vector3, Color4 } from "@babylonjs/core";
 import type { Scene } from "@babylonjs/core";
+import { STAR_TYPES, StarType } from "../data/StarMap";
 import type { StarData } from "../data/StarMap";
 
 const SPRITE_BLEND_ADD = 1; // ALPHA_ADD
 const STAR_TEXTURE_SIZE = 128;
 
-/** Multiplier from star luminosity to sprite world-unit size */
+/** Base multipliers from star luminosity to sprite world-unit size */
 const CORE_SIZE_FACTOR = 1.8;
 const HALO_SIZE_FACTOR = 6.2;
 
-/** How strongly star type colors are preserved (0 = white, 1 = full color). */
-const TINT_STRENGTH = 0.34;
-
 const CORE_BASE_ALPHA = 0.95;
 const HALO_BASE_ALPHA = 0.38;
+
+// Slight anti-blur tuning: keep stars visible but tighten halo falloff.
+const HALO_TEXTURE_MIDDLE_STOP = 0.24;
+const HALO_TEXTURE_EDGE_STOP = 0.62;
+const HALO_TEXTURE_MIDDLE_ALPHA = 0.28;
+const HALO_TEXTURE_EDGE_ALPHA = 0.05;
+
+// Galaxy readability rebalance requested by design:
+// - oversized blue/red stars are reduced
+// - the rest are slightly boosted to stay legible at all zooms
+const LARGE_STAR_SIZE_SCALE = 0.8;
+const NORMAL_STAR_SIZE_SCALE = 1.2;
+const LARGE_STAR_BLOOM_SCALE = 0.8;
+const NORMAL_STAR_BLOOM_SCALE = 1.2;
+const TINY_STAR_CORE_THRESHOLD = 0.85;
+const TINY_STAR_SIZE_BOOST = 1.5;
+const TINY_STAR_BLOOM_ALPHA_BOOST = 1.25;
+
+// Small yellow/red stars need stronger gameplay readability at full zoom-out.
+const SMALL_YELLOW_RED_CORE_SIZE_BOOST = 1.7;
+const SMALL_YELLOW_RED_HALO_SIZE_BOOST = 2.0;
+const SMALL_YELLOW_RED_BLOOM_ALPHA_BOOST = 1.55;
+
+// Hard visibility floors used in galaxy view so all stars remain readable.
+const HARD_RENDER_LUMINOSITY_FLOOR = 0.55;
+const HARD_CORE_SIZE_FLOOR = 1.0;
+const HARD_HALO_SIZE_FLOOR = 3.4;
+const HARD_CORE_ALPHA_FLOOR = 0.42;
+const HARD_HALO_ALPHA_FLOOR = 0.28;
+
+// Compact objects should read as smaller than giants, but still gameplay-visible.
+const BIG_STAR_GAMEPLAY_CORE_REFERENCE = 4.4;
+const BIG_STAR_GAMEPLAY_HALO_REFERENCE = 14.2;
+const COMPACT_OBJECT_SIZE_RATIO = 0.65;
+const COMPACT_OBJECT_CORE_SIZE_FLOOR =
+  BIG_STAR_GAMEPLAY_CORE_REFERENCE * COMPACT_OBJECT_SIZE_RATIO;
+const COMPACT_OBJECT_HALO_SIZE_FLOOR =
+  BIG_STAR_GAMEPLAY_HALO_REFERENCE * COMPACT_OBJECT_SIZE_RATIO;
+
+const BLACK_HOLE_CORE_ALPHA_FLOOR = 0.55;
+const BLACK_HOLE_HALO_ALPHA_FLOOR = 0.4;
+
+// Relative bloom guarantee: every star keeps at least half of the strongest bloom profile.
+const MIN_RELATIVE_BLOOM_RATIO = 0.5;
+
+// Pulse tuning:
+// - strong pulsing stars never drop below a visible glow floor
+// - pulsing cadence is intentionally slower for readability
+const STRONG_PULSE_FLOOR = 0.35;
+const SUBTLE_PULSE_FLOOR = 0.85;
+const STRONG_PULSE_SPEED_SCALE = 0.22;
+const SUBTLE_PULSE_SPEED_SCALE = 0.6;
 
 function clamp01(v: number): number {
   return Math.max(0, Math.min(1, v));
@@ -37,11 +87,11 @@ function mix(a: number, b: number, t: number): number {
   return a + (b - a) * t;
 }
 
-function softenColor(color: [number, number, number]): Color4 {
+function softenColor(color: [number, number, number], preservation: number): Color4 {
   return new Color4(
-    mix(1, color[0], TINT_STRENGTH),
-    mix(1, color[1], TINT_STRENGTH),
-    mix(1, color[2], TINT_STRENGTH),
+    mix(1, color[0], preservation),
+    mix(1, color[1], preservation),
+    mix(1, color[2], preservation),
     1,
   );
 }
@@ -51,6 +101,7 @@ function createRadialTextureDataURL(
   middleStop: number,
   edgeStop: number,
   middleAlpha: number,
+  edgeAlpha = 0.08,
 ): string {
   const canvas = document.createElement("canvas");
   canvas.width = size;
@@ -66,7 +117,7 @@ function createRadialTextureDataURL(
   const grad = ctx.createRadialGradient(c, c, 0, c, c, c);
   grad.addColorStop(0, "rgba(255,255,255,1)");
   grad.addColorStop(middleStop, `rgba(255,255,255,${middleAlpha})`);
-  grad.addColorStop(edgeStop, "rgba(255,255,255,0.08)");
+  grad.addColorStop(edgeStop, `rgba(255,255,255,${edgeAlpha})`);
   grad.addColorStop(1, "rgba(255,255,255,0)");
 
   ctx.clearRect(0, 0, size, size);
@@ -89,10 +140,24 @@ export class StarFieldRenderer {
   // Current per-star overrides (applied each frame via applyVisuals)
   private alphaOverrides: Float32Array;
   private scaleOverrides: Float32Array;
+  private coreBaseAlphas: Float32Array;
+  private haloBaseAlphas: Float32Array;
+  private pulseAmplitude: Float32Array;
+  private pulseFrequency: Float32Array;
+  private pulseFloor: Float32Array;
+  private pulsePhase: Float32Array;
+
   private zoomOutBlend = 1;
+  private elapsedTime = 0;
 
   constructor(scene: Scene, stars: StarData[]) {
-    const haloTexture = createRadialTextureDataURL(STAR_TEXTURE_SIZE, 0.35, 0.78, 0.34);
+    const haloTexture = createRadialTextureDataURL(
+      STAR_TEXTURE_SIZE,
+      HALO_TEXTURE_MIDDLE_STOP,
+      HALO_TEXTURE_EDGE_STOP,
+      HALO_TEXTURE_MIDDLE_ALPHA,
+      HALO_TEXTURE_EDGE_ALPHA,
+    );
     const coreTexture = createRadialTextureDataURL(STAR_TEXTURE_SIZE, 0.07, 0.33, 0.92);
 
     this.haloManager = new SpriteManager(
@@ -117,14 +182,22 @@ export class StarFieldRenderer {
     this.haloManager.fogEnabled = false;
     this.coreManager.fogEnabled = false;
 
-    // Use additive blending for a natural glow look
     this.haloManager.blendMode = SPRITE_BLEND_ADD;
     this.coreManager.blendMode = SPRITE_BLEND_ADD;
 
     this.alphaOverrides = new Float32Array(stars.length).fill(1);
     this.scaleOverrides = new Float32Array(stars.length).fill(1);
+    this.coreBaseAlphas = new Float32Array(stars.length).fill(CORE_BASE_ALPHA);
+    this.haloBaseAlphas = new Float32Array(stars.length).fill(HALO_BASE_ALPHA);
+    this.pulseAmplitude = new Float32Array(stars.length).fill(0);
+    this.pulseFrequency = new Float32Array(stars.length).fill(1);
+    this.pulseFloor = new Float32Array(stars.length).fill(SUBTLE_PULSE_FLOOR);
+    this.pulsePhase = new Float32Array(stars.length).fill(0);
 
-    for (const star of stars) {
+    for (let i = 0; i < stars.length; i++) {
+      const star = stars[i];
+      const typeCfg = STAR_TYPES[star.type];
+
       const halo = new Sprite(`star_halo_${star.id}`, this.haloManager);
       const core = new Sprite(`star_core_${star.id}`, this.coreManager);
 
@@ -132,16 +205,93 @@ export class StarFieldRenderer {
       halo.position = pos.clone();
       core.position = pos;
 
-      const coreSize = star.luminosity * CORE_SIZE_FACTOR;
-      const haloSize = star.luminosity * HALO_SIZE_FACTOR;
+      const isLargeBlueOrRedStar =
+        star.type === StarType.B
+        || star.type === StarType.A
+        || typeCfg.kind === "red-giant";
+
+      const sizeScale = isLargeBlueOrRedStar ? LARGE_STAR_SIZE_SCALE : NORMAL_STAR_SIZE_SCALE;
+      const bloomScale = isLargeBlueOrRedStar ? LARGE_STAR_BLOOM_SCALE : NORMAL_STAR_BLOOM_SCALE;
+      const isBlackHole = typeCfg.kind === "black-hole";
+      const isCompactObject =
+        typeCfg.kind === "black-hole"
+        || typeCfg.kind === "neutron-star"
+        || typeCfg.kind === "pulsar";
+      const isSmallYellowOrRedStar =
+        star.type === StarType.G
+        || star.type === StarType.K
+        || star.type === StarType.M;
+
+      const coreSizeBoost = isSmallYellowOrRedStar ? SMALL_YELLOW_RED_CORE_SIZE_BOOST : 1;
+      const haloSizeBoost = isSmallYellowOrRedStar ? SMALL_YELLOW_RED_HALO_SIZE_BOOST : 1;
+      const bloomAlphaBoost = isSmallYellowOrRedStar ? SMALL_YELLOW_RED_BLOOM_ALPHA_BOOST : 1;
+
+      const renderLuminosity = Math.max(star.luminosity, HARD_RENDER_LUMINOSITY_FLOOR);
+      let coreSize =
+        renderLuminosity * CORE_SIZE_FACTOR * typeCfg.galaxyCoreScale * sizeScale * coreSizeBoost;
+      let haloSize =
+        renderLuminosity * HALO_SIZE_FACTOR * typeCfg.galaxyHaloScale * sizeScale * haloSizeBoost;
+
+      const tinySizeBoost = coreSize < TINY_STAR_CORE_THRESHOLD ? TINY_STAR_SIZE_BOOST : 1;
+      const tinyBloomBoost = tinySizeBoost > 1 ? TINY_STAR_BLOOM_ALPHA_BOOST : 1;
+
+      coreSize = Math.max(
+        coreSize * tinySizeBoost,
+        isCompactObject ? COMPACT_OBJECT_CORE_SIZE_FLOOR : HARD_CORE_SIZE_FLOOR,
+      );
+      haloSize = Math.max(
+        haloSize * tinySizeBoost,
+        isCompactObject ? COMPACT_OBJECT_HALO_SIZE_FLOOR : HARD_HALO_SIZE_FLOOR,
+      );
+
       core.width = coreSize;
       core.height = coreSize;
       halo.width = haloSize;
       halo.height = haloSize;
 
-      const c = softenColor(star.color);
-      core.color = new Color4(c.r, c.g, c.b, CORE_BASE_ALPHA);
-      halo.color = new Color4(c.r, c.g, c.b, HALO_BASE_ALPHA);
+      const c = softenColor(star.color, typeCfg.galaxyColorPreservation);
+
+      let coreAlpha = CORE_BASE_ALPHA;
+      let haloAlpha = HALO_BASE_ALPHA;
+
+      switch (typeCfg.kind) {
+        case "red-giant":
+          haloAlpha = 0.5;
+          break;
+        case "brown-dwarf":
+          coreAlpha = 0.72;
+          haloAlpha = 0.24;
+          break;
+        case "neutron-star":
+          coreAlpha = 1.0;
+          haloAlpha = 0.3;
+          break;
+        case "pulsar":
+          coreAlpha = 1.0;
+          haloAlpha = 0.5;
+          break;
+        case "black-hole":
+          coreAlpha = 0.22;
+          haloAlpha = 0.34;
+          break;
+        default:
+          break;
+      }
+
+      coreAlpha = clamp01(coreAlpha * (isLargeBlueOrRedStar ? 0.9 : 1.08));
+      haloAlpha = clamp01(haloAlpha * bloomScale * tinyBloomBoost * bloomAlphaBoost);
+
+      coreAlpha = Math.max(
+        coreAlpha,
+        isBlackHole ? BLACK_HOLE_CORE_ALPHA_FLOOR : HARD_CORE_ALPHA_FLOOR,
+      );
+      haloAlpha = Math.max(
+        haloAlpha,
+        isBlackHole ? BLACK_HOLE_HALO_ALPHA_FLOOR : HARD_HALO_ALPHA_FLOOR,
+      );
+
+      core.color = new Color4(c.r, c.g, c.b, coreAlpha);
+      halo.color = new Color4(c.r, c.g, c.b, haloAlpha);
 
       this.coreSprites.push(core);
       this.haloSprites.push(halo);
@@ -149,10 +299,51 @@ export class StarFieldRenderer {
       this.baseCoreSizes.push(coreSize);
       this.baseHaloSizes.push(haloSize);
       this.starPositions.push({ x: star.x, z: star.z });
+
+      this.coreBaseAlphas[i] = coreAlpha;
+      this.haloBaseAlphas[i] = haloAlpha;
+      this.pulseAmplitude[i] = star.galaxyPulseAmplitude;
+      const isStrongPulser = typeCfg.kind === "pulsar" || typeCfg.kind === "neutron-star";
+      this.pulseFrequency[i] = star.galaxyPulseFrequency
+        * (isStrongPulser ? STRONG_PULSE_SPEED_SCALE : SUBTLE_PULSE_SPEED_SCALE);
+      this.pulseFloor[i] = isStrongPulser ? STRONG_PULSE_FLOOR : SUBTLE_PULSE_FLOOR;
+      this.pulsePhase[i] = (star.id * 2.399963229728653) % (Math.PI * 2);
+    }
+
+    this.enforceRelativeBloomFloor(MIN_RELATIVE_BLOOM_RATIO);
+  }
+
+  private enforceRelativeBloomFloor(minRatio: number): void {
+    if (this.baseHaloSizes.length === 0) return;
+
+    let maxHaloSize = 0;
+    let maxHaloAlpha = 0;
+    for (let i = 0; i < this.baseHaloSizes.length; i++) {
+      if (this.baseHaloSizes[i] > maxHaloSize) maxHaloSize = this.baseHaloSizes[i];
+      if (this.haloBaseAlphas[i] > maxHaloAlpha) maxHaloAlpha = this.haloBaseAlphas[i];
+    }
+
+    const minHaloSize = maxHaloSize * minRatio;
+    const minHaloAlpha = maxHaloAlpha * minRatio;
+
+    for (let i = 0; i < this.baseHaloSizes.length; i++) {
+      const haloSize = Math.max(this.baseHaloSizes[i], minHaloSize);
+      const haloAlpha = Math.max(this.haloBaseAlphas[i], minHaloAlpha);
+
+      this.baseHaloSizes[i] = haloSize;
+      this.haloBaseAlphas[i] = haloAlpha;
+
+      const halo = this.haloSprites[i];
+      const base = this.baseColors[i];
+      halo.width = haloSize;
+      halo.height = haloSize;
+      halo.color.set(base.r, base.g, base.b, clamp01(haloAlpha));
     }
   }
 
-  /* ─── Per-star low-level overrides ─── */
+  update(deltaTime: number): void {
+    this.elapsedTime += deltaTime;
+  }
 
   /** Set alpha for a specific star (0 = invisible, 1 = full). */
   setStarAlpha(starId: number, alpha: number): void {
@@ -175,8 +366,6 @@ export class StarFieldRenderer {
   setZoomOutBlend(zoomOutBlend: number): void {
     this.zoomOutBlend = clamp01(zoomOutBlend);
   }
-
-  /* ─── Neighbor suppression ─── */
 
   /**
    * Suppress (fade + shrink) all stars within `radius` of the focus star.
@@ -207,15 +396,13 @@ export class StarFieldRenderer {
       const distSq = dx * dx + dz * dz;
 
       if (distSq < rSq) {
-        // Distance-based falloff: closer neighbors get suppressed more
         const dist = Math.sqrt(distSq);
-        const proximity = 1 - dist / radius; // 1 at center, 0 at edge
+        const proximity = 1 - dist / radius;
         const localStrength = strength * proximity;
 
         const targetAlpha = 1 - localStrength * (1 - minAlpha);
         const targetScale = 1 - localStrength * (1 - shrinkFactor);
 
-        // Only suppress, never boost — take min with current
         this.alphaOverrides[i] = Math.min(this.alphaOverrides[i], targetAlpha);
         this.scaleOverrides[i] = Math.min(this.scaleOverrides[i], targetScale);
       }
@@ -237,9 +424,9 @@ export class StarFieldRenderer {
    */
   applyVisuals(): void {
     const coreScaleBoost = mix(1.0, 1.45, this.zoomOutBlend);
-    const haloScaleBoost = mix(1.0, 2.2, this.zoomOutBlend);
-    const coreAlphaBoost = mix(0.9, 1.25, this.zoomOutBlend);
-    const haloAlphaBoost = mix(1.0, 2.2, this.zoomOutBlend);
+    const haloScaleBoost = mix(1.0, 1.65, this.zoomOutBlend);
+    const coreAlphaBoost = mix(0.95, 1.35, this.zoomOutBlend);
+    const haloAlphaBoost = mix(1.0, 1.65, this.zoomOutBlend);
 
     for (let i = 0; i < this.coreSprites.length; i++) {
       const base = this.baseColors[i];
@@ -248,16 +435,35 @@ export class StarFieldRenderer {
       const coreSize = this.baseCoreSizes[i];
       const haloSize = this.baseHaloSizes[i];
 
+      const pulseWave =
+        0.5 + 0.5 * Math.sin(this.elapsedTime * this.pulseFrequency[i] + this.pulsePhase[i]);
+      const pulseTarget = this.pulseFloor[i] + (1 - this.pulseFloor[i]) * pulseWave;
+      const pulseInfluence = clamp01(this.pulseAmplitude[i] * 2.0);
+
+      const corePulseScale = mix(1, pulseTarget, pulseInfluence);
+      const haloPulseScale = mix(1, pulseTarget, clamp01(pulseInfluence * 1.1));
+      const alphaPulse = mix(1, pulseTarget, pulseInfluence);
+
       const core = this.coreSprites[i];
       const halo = this.haloSprites[i];
 
-      core.width = coreSize * s * coreScaleBoost;
-      core.height = coreSize * s * coreScaleBoost;
-      halo.width = haloSize * s * haloScaleBoost;
-      halo.height = haloSize * s * haloScaleBoost;
+      core.width = coreSize * s * coreScaleBoost * corePulseScale;
+      core.height = coreSize * s * coreScaleBoost * corePulseScale;
+      halo.width = haloSize * s * haloScaleBoost * haloPulseScale;
+      halo.height = haloSize * s * haloScaleBoost * haloPulseScale;
 
-      core.color.set(base.r, base.g, base.b, clamp01(CORE_BASE_ALPHA * a * coreAlphaBoost));
-      halo.color.set(base.r, base.g, base.b, clamp01(HALO_BASE_ALPHA * a * haloAlphaBoost));
+      core.color.set(
+        base.r,
+        base.g,
+        base.b,
+        clamp01(this.coreBaseAlphas[i] * a * coreAlphaBoost * alphaPulse),
+      );
+      halo.color.set(
+        base.r,
+        base.g,
+        base.b,
+        clamp01(this.haloBaseAlphas[i] * a * haloAlphaBoost * alphaPulse),
+      );
     }
   }
 
@@ -272,3 +478,4 @@ export class StarFieldRenderer {
     this.starPositions = [];
   }
 }
+

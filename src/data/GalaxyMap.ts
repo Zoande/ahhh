@@ -1,6 +1,6 @@
 /**
  * GalaxyMap — Galaxy-level configuration.
- * Defines overall map dimensions, camera limits, and transition thresholds.
+ * Defines overall map dimensions and camera limits.
  * This is the top-level data layer: GalaxyMap → StarMap → (future: planets, objects)
  */
 
@@ -43,50 +43,6 @@ export interface GalaxyMapConfig {
     wheelDeltaPercentage: number;
     inertia: number;
   };
-
-  /** Zoom-based transition thresholds for star system view */
-  transition: {
-    /** Camera radius where system starts becoming visible */
-    systemFadeStart: number;
-    /** Camera radius where system is fully visible */
-    systemFadeEnd: number;
-    /** Max distance from camera target to star center to be "focused" */
-    focusDistance: number;
-    /** Max panning radius when fully zoomed into a system */
-    systemBorderRadius: number;
-    /** System scale at the moment it fully fades in (entry point) */
-    systemScaleAtEntry: number;
-    /** Camera radius at which system reaches full (1.0) scale */
-    systemFullScaleRadius: number;
-
-    /* ── Zoom-out hysteresis (asymmetric exit) ── */
-    /** Camera radius where system starts fading on zoom-OUT (larger = harder to leave) */
-    systemFadeStartOut: number;
-    /** Camera radius where system is fully gone on zoom-OUT */
-    systemFadeEndOut: number;
-    /** Focus distance used when already inside a system (more lenient) */
-    focusDistanceOut: number;
-
-    /* ── Neighbor suppression ── */
-    /** World-unit radius around the focus star for suppression */
-    suppressionRadius: number;
-    /** Blend threshold (0–1) at which suppression begins */
-    suppressionStartBlend: number;
-    /** Minimum alpha for fully suppressed neighbors */
-    suppressionMinAlpha: number;
-    /** Scale factor for fully suppressed neighbors (e.g. 0.3 = 30%) */
-    suppressionShrinkFactor: number;
-
-    /* ── Camera magnetization ── */
-    /** Blend threshold at which camera starts centering on the star */
-    magnetStartBlend: number;
-    /** Strength of per-frame camera pull toward star (0–1) */
-    magnetStrength: number;
-
-    /* ── Target lock ── */
-    /** Blend above which the focused star is locked (can't switch targets) */
-    lockBlendThreshold: number;
-  };
 }
 
 export const GALAXY_MAP: GalaxyMapConfig = {
@@ -114,32 +70,5 @@ export const GALAXY_MAP: GalaxyMapConfig = {
     maxBeta: Math.PI / 2.2,
     wheelDeltaPercentage: 0.08,
     inertia: 0.85,
-  },
-
-  transition: {
-    systemFadeStart: 30,
-    systemFadeEnd: 12,
-    focusDistance: 18,
-    systemBorderRadius: 20,
-    systemScaleAtEntry: 0.15,
-    systemFullScaleRadius: 3,
-
-    // Zoom-out hysteresis (2.5x harder to leave system view)
-    systemFadeStartOut: 75,
-    systemFadeEndOut: 30,
-    focusDistanceOut: 45,
-
-    // Neighbor suppression
-    suppressionRadius: 80,
-    suppressionStartBlend: 0.05,
-    suppressionMinAlpha: 0.04,
-    suppressionShrinkFactor: 0.25,
-
-    // Camera magnetization
-    magnetStartBlend: 0.08,
-    magnetStrength: 3.0,
-
-    // Target lock
-    lockBlendThreshold: 0.12,
   },
 };

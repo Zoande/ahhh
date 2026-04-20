@@ -1,0 +1,931 @@
+/**
+ * SystemScene
+ * Dedicated star-system view entered from the galaxy map.
+ * Escape triggers a scene-level exit callback back to GalaxyScene.
+ */
+
+import {
+  Scene,
+  Vector3,
+  Color3,
+  Color4,
+  ArcRotateCamera,
+  HemisphericLight,
+  PointLight,
+  MeshBuilder,
+  StandardMaterial,
+  Texture,
+  GlowLayer,
+  TransformNode,
+} from "@babylonjs/core";
+import type { AbstractEngine, LinesMesh, Mesh } from "@babylonjs/core";
+import type { IGameScene } from "../SceneManager";
+import { STAR_TYPES, StarType } from "../data/StarMap";
+import type { PlanetConfig, StarData, StarVisualKind } from "../data/StarMap";
+import { OrbitSystem } from "../systems/OrbitSystem";
+
+type ExitSystemHandler = () => void | Promise<void>;
+
+export class SystemScene implements IGameScene {
+  public scene: Scene;
+  private engine: AbstractEngine;
+  private star: StarData;
+  private readonly onExitSystem: ExitSystemHandler;
+
+  private camera!: ArcRotateCamera;
+  private glowLayer!: GlowLayer;
+  private starMesh: Mesh | null = null;
+  private starDetailMesh: Mesh | null = null;
+  private starCoronaMesh: Mesh | null = null;
+  private starLight: PointLight | null = null;
+  private fillLight: PointLight | null = null;
+
+  private pulsarBeamPivot: TransformNode | null = null;
+  private pulsarBeamMaterial: StandardMaterial | null = null;
+
+  private blackHoleDiskOuter: Mesh | null = null;
+  private blackHoleDiskInner: Mesh | null = null;
+
+  private orbitSystem = new OrbitSystem();
+  private orbitRings: LinesMesh[] = [];
+  private isExiting = false;
+  private elapsed = 0;
+
+  private starKind: StarVisualKind = "main-sequence";
+
+  // Tunable visual profile (configured per star type)
+  private glowBaseIntensity = 1.7;
+  private glowPulseAmplitude = 0.18;
+  private glowPulseSpeed = 1.3;
+
+  private coronaPulseAmplitude = 0.035;
+  private coronaPulseSpeed = 1.8;
+
+  private starRotationSpeed = 0.04;
+  private starDetailRotationSpeed = -0.09;
+  private starDetailTiltSpeed = 0.015;
+
+  private starBaseEmissiveScale = 1.75;
+  private starDetailEmissiveScale = 1.3;
+  private starDetailTextureLevel = 1.5;
+  private starDetailAlpha = 0.68;
+  private starCoronaScale = 1.22;
+  private starCoronaAlpha = 0.34;
+  private systemScaleMultiplier = 1.15;
+  private detailTexturePath = "/textures/star_surface.png";
+
+  private ambientIntensity = 0.2;
+  private bounceIntensity = 0.08;
+  private starLightIntensity = 3.2;
+  private starLightRange = 220;
+  private fillIntensity = 0.55;
+  private fillColor = new Color3(0.32, 0.38, 0.5);
+
+  private orbitBaseOffset = 14;
+  private orbitSpacing = 11;
+  private planetNightLift = new Color3(0.12, 0.12, 0.15);
+
+  private readonly onEscapeKey = (ev: KeyboardEvent): void => {
+    if (ev.key !== "Escape") return;
+    ev.preventDefault();
+    this.requestExit();
+  };
+
+  constructor(engine: AbstractEngine, star: StarData, onExitSystem: ExitSystemHandler) {
+    this.engine = engine;
+    this.star = star;
+    this.onExitSystem = onExitSystem;
+    this.scene = new Scene(engine);
+    this.scene.clearColor = new Color4(0.01, 0.015, 0.03, 1);
+  }
+
+  async setup(): Promise<void> {
+    const canvas = this.engine.getRenderingCanvas()!;
+
+    this.configureVisualPreset();
+    this.setupBackground();
+    this.setupCamera(canvas);
+    this.setupLighting();
+    this.buildSystemObjects();
+
+    window.addEventListener("keydown", this.onEscapeKey);
+    await this.scene.whenReadyAsync();
+  }
+
+  onBeforeRender(): void {
+    const dt = this.engine.getDeltaTime() / 1000;
+    this.elapsed += dt;
+
+    this.orbitSystem.update(dt);
+
+    if (this.starMesh) {
+      this.starMesh.rotation.y += this.starRotationSpeed * dt;
+    }
+    if (this.starDetailMesh) {
+      this.starDetailMesh.rotation.y += this.starDetailRotationSpeed * dt;
+      this.starDetailMesh.rotation.x += this.starDetailTiltSpeed * dt;
+    }
+
+    if (this.starCoronaMesh && this.starKind !== "black-hole") {
+      const coronaPulse = 1 + this.coronaPulseAmplitude * Math.sin(this.elapsed * this.coronaPulseSpeed);
+      this.starCoronaMesh.scaling.setAll(coronaPulse);
+    }
+
+    if (this.starKind === "pulsar") {
+      const beamPulse = 0.5 + 0.5 * Math.abs(Math.sin(this.elapsed * this.glowPulseSpeed));
+
+      if (this.pulsarBeamPivot) {
+        this.pulsarBeamPivot.rotation.y += 8.5 * dt;
+        this.pulsarBeamPivot.rotation.z = 0.25 * Math.sin(this.elapsed * 0.8);
+      }
+      if (this.pulsarBeamMaterial) {
+        this.pulsarBeamMaterial.alpha = 0.2 + 0.65 * beamPulse;
+      }
+      if (this.starLight) {
+        this.starLight.intensity = this.starLightIntensity * (0.6 + 0.95 * beamPulse);
+      }
+      if (this.fillLight) {
+        this.fillLight.intensity = this.fillIntensity * (0.5 + 0.8 * beamPulse);
+      }
+
+      this.glowLayer.intensity = this.glowBaseIntensity + this.glowPulseAmplitude * beamPulse;
+    } else if (this.starKind === "black-hole") {
+      if (this.blackHoleDiskOuter) {
+        this.blackHoleDiskOuter.rotation.y += 0.28 * dt;
+      }
+      if (this.blackHoleDiskInner) {
+        this.blackHoleDiskInner.rotation.y -= 0.4 * dt;
+      }
+
+      const diskPulse = 0.7 + 0.3 * Math.sin(this.elapsed * this.glowPulseSpeed);
+      this.glowLayer.intensity = this.glowBaseIntensity + this.glowPulseAmplitude * diskPulse;
+    } else {
+      this.glowLayer.intensity =
+        this.glowBaseIntensity + this.glowPulseAmplitude * Math.sin(this.elapsed * this.glowPulseSpeed);
+    }
+  }
+
+  private configureVisualPreset(): void {
+    const typeCfg = STAR_TYPES[this.star.type];
+    this.starKind = typeCfg.kind;
+
+    // Defaults
+    this.glowBaseIntensity = 1.7;
+    this.glowPulseAmplitude = 0.18;
+    this.glowPulseSpeed = 1.3;
+
+    this.coronaPulseAmplitude = 0.035;
+    this.coronaPulseSpeed = 1.8;
+
+    this.starRotationSpeed = 0.04;
+    this.starDetailRotationSpeed = -0.09;
+    this.starDetailTiltSpeed = 0.015;
+
+    this.starBaseEmissiveScale = 1.75;
+    this.starDetailEmissiveScale = 1.3;
+    this.starDetailTextureLevel = 1.5;
+    this.starDetailAlpha = 0.68;
+    this.starCoronaScale = 1.22;
+    this.starCoronaAlpha = 0.34;
+    this.systemScaleMultiplier = 1.15;
+    this.detailTexturePath = "/textures/star_surface.png";
+
+    this.ambientIntensity = 0.2;
+    this.bounceIntensity = 0.08;
+    this.starLightIntensity = 3.2;
+    this.starLightRange = 220;
+    this.fillIntensity = 0.55;
+    this.fillColor = new Color3(0.32, 0.38, 0.5);
+
+    this.orbitBaseOffset = 14;
+    this.orbitSpacing = 11;
+    this.planetNightLift = new Color3(0.12, 0.12, 0.15);
+
+    switch (this.star.type) {
+      case StarType.B:
+        this.starBaseEmissiveScale = 2.1;
+        this.starDetailEmissiveScale = 1.6;
+        this.starDetailTextureLevel = 1.9;
+        this.starCoronaScale = 1.38;
+        this.starCoronaAlpha = 0.46;
+
+        this.starRotationSpeed = 0.07;
+        this.starDetailRotationSpeed = -0.16;
+        this.starDetailTiltSpeed = 0.02;
+
+        this.glowBaseIntensity = 2.05;
+        this.glowPulseAmplitude = 0.24;
+        this.glowPulseSpeed = 1.9;
+
+        this.starLightIntensity = 4.2;
+        this.starLightRange = 260;
+        this.fillIntensity = 0.7;
+        this.fillColor = new Color3(0.36, 0.43, 0.62);
+        break;
+
+      case StarType.A:
+        this.starBaseEmissiveScale = 1.95;
+        this.starDetailEmissiveScale = 1.45;
+        this.starDetailTextureLevel = 1.7;
+        this.starCoronaScale = 1.32;
+        this.starCoronaAlpha = 0.4;
+
+        this.starRotationSpeed = 0.06;
+        this.starDetailRotationSpeed = -0.13;
+        this.starDetailTiltSpeed = 0.018;
+
+        this.glowBaseIntensity = 1.9;
+        this.glowPulseAmplitude = 0.18;
+        this.glowPulseSpeed = 1.6;
+
+        this.starLightIntensity = 3.8;
+        this.starLightRange = 245;
+        this.fillIntensity = 0.62;
+        this.fillColor = new Color3(0.36, 0.41, 0.56);
+        break;
+
+      case StarType.F:
+        this.starBaseEmissiveScale = 1.72;
+        this.starDetailEmissiveScale = 1.28;
+        this.starDetailTextureLevel = 1.45;
+        this.starCoronaScale = 1.24;
+        this.starCoronaAlpha = 0.34;
+
+        this.starLightIntensity = 3.3;
+        this.starLightRange = 225;
+        this.fillIntensity = 0.58;
+        this.fillColor = new Color3(0.4, 0.4, 0.45);
+        break;
+
+      case StarType.G:
+        this.starBaseEmissiveScale = 1.62;
+        this.starDetailEmissiveScale = 1.22;
+        this.starDetailTextureLevel = 1.38;
+        this.starCoronaScale = 1.2;
+        this.starCoronaAlpha = 0.3;
+
+        this.starLightIntensity = 3.0;
+        this.starLightRange = 215;
+        this.fillIntensity = 0.52;
+        this.fillColor = new Color3(0.38, 0.35, 0.32);
+        break;
+
+      case StarType.K:
+        this.starBaseEmissiveScale = 1.45;
+        this.starDetailEmissiveScale = 1.1;
+        this.starDetailTextureLevel = 1.25;
+        this.starCoronaScale = 1.16;
+        this.starCoronaAlpha = 0.28;
+
+        this.starRotationSpeed = 0.03;
+        this.starDetailRotationSpeed = -0.07;
+
+        this.glowBaseIntensity = 1.45;
+        this.glowPulseAmplitude = 0.12;
+
+        this.starLightIntensity = 2.6;
+        this.starLightRange = 200;
+        this.fillIntensity = 0.48;
+        this.fillColor = new Color3(0.4, 0.3, 0.26);
+        break;
+
+      case StarType.M:
+        this.starBaseEmissiveScale = 1.2;
+        this.starDetailEmissiveScale = 1.0;
+        this.starDetailTextureLevel = 1.18;
+        this.starDetailAlpha = 0.72;
+        this.starCoronaScale = 1.15;
+        this.starCoronaAlpha = 0.26;
+
+        this.starRotationSpeed = 0.028;
+        this.starDetailRotationSpeed = -0.05;
+
+        this.glowBaseIntensity = 1.2;
+        this.glowPulseAmplitude = 0.2;
+        this.glowPulseSpeed = 1.15;
+
+        this.starLightIntensity = 2.0;
+        this.starLightRange = 175;
+        this.fillIntensity = 0.44;
+        this.fillColor = new Color3(0.34, 0.25, 0.23);
+        break;
+
+      case StarType.MRedGiant:
+        this.starBaseEmissiveScale = 1.55;
+        this.starDetailEmissiveScale = 1.12;
+        this.starDetailTextureLevel = 1.35;
+        this.starDetailAlpha = 0.62;
+        this.starCoronaScale = 1.72;
+        this.starCoronaAlpha = 0.52;
+        this.systemScaleMultiplier = 1.75;
+
+        this.starRotationSpeed = 0.018;
+        this.starDetailRotationSpeed = -0.042;
+        this.starDetailTiltSpeed = 0.01;
+
+        this.glowBaseIntensity = 1.95;
+        this.glowPulseAmplitude = 0.28;
+        this.glowPulseSpeed = 0.75;
+
+        this.ambientIntensity = 0.24;
+        this.bounceIntensity = 0.11;
+        this.starLightIntensity = 4.0;
+        this.starLightRange = 350;
+        this.fillIntensity = 0.75;
+        this.fillColor = new Color3(0.5, 0.32, 0.22);
+
+        this.orbitBaseOffset = 28;
+        this.orbitSpacing = 16;
+        this.planetNightLift = new Color3(0.14, 0.13, 0.14);
+        break;
+
+      case StarType.TBrownDwarf:
+        this.starBaseEmissiveScale = 0.72;
+        this.starDetailEmissiveScale = 0.62;
+        this.starDetailTextureLevel = 1.0;
+        this.starDetailAlpha = 0.78;
+        this.starCoronaScale = 1.08;
+        this.starCoronaAlpha = 0.12;
+        this.systemScaleMultiplier = 1.0;
+        this.detailTexturePath = "/textures/gas_giant.png";
+
+        this.starRotationSpeed = 0.03;
+        this.starDetailRotationSpeed = -0.05;
+
+        this.glowBaseIntensity = 0.95;
+        this.glowPulseAmplitude = 0.08;
+        this.glowPulseSpeed = 0.9;
+
+        this.ambientIntensity = 0.16;
+        this.bounceIntensity = 0.07;
+        this.starLightIntensity = 1.2;
+        this.starLightRange = 130;
+        this.fillIntensity = 0.42;
+        this.fillColor = new Color3(0.3, 0.22, 0.2);
+
+        this.orbitBaseOffset = 12;
+        this.orbitSpacing = 10;
+        this.planetNightLift = new Color3(0.16, 0.15, 0.16);
+        break;
+
+      case StarType.NeutronStar:
+        this.starBaseEmissiveScale = 3.0;
+        this.starDetailEmissiveScale = 2.3;
+        this.starDetailTextureLevel = 2.2;
+        this.starDetailAlpha = 0.45;
+        this.starCoronaScale = 1.55;
+        this.starCoronaAlpha = 0.28;
+        this.systemScaleMultiplier = 0.48;
+
+        this.starRotationSpeed = 0.34;
+        this.starDetailRotationSpeed = -0.55;
+        this.starDetailTiltSpeed = 0.03;
+
+        this.glowBaseIntensity = 2.35;
+        this.glowPulseAmplitude = 0.42;
+        this.glowPulseSpeed = 3.2;
+
+        this.ambientIntensity = 0.18;
+        this.bounceIntensity = 0.07;
+        this.starLightIntensity = 4.8;
+        this.starLightRange = 190;
+        this.fillIntensity = 0.62;
+        this.fillColor = new Color3(0.35, 0.43, 0.62);
+
+        this.orbitBaseOffset = 13;
+        this.orbitSpacing = 10;
+        this.planetNightLift = new Color3(0.14, 0.14, 0.16);
+        break;
+
+      case StarType.Pulsar:
+        this.starBaseEmissiveScale = 3.3;
+        this.starDetailEmissiveScale = 2.5;
+        this.starDetailTextureLevel = 2.4;
+        this.starDetailAlpha = 0.5;
+        this.starCoronaScale = 1.65;
+        this.starCoronaAlpha = 0.35;
+        this.systemScaleMultiplier = 0.42;
+
+        this.starRotationSpeed = 0.85;
+        this.starDetailRotationSpeed = -1.4;
+        this.starDetailTiltSpeed = 0.06;
+
+        this.glowBaseIntensity = 2.6;
+        this.glowPulseAmplitude = 0.95;
+        this.glowPulseSpeed = 7.5;
+
+        this.ambientIntensity = 0.17;
+        this.bounceIntensity = 0.07;
+        this.starLightIntensity = 3.0;
+        this.starLightRange = 220;
+        this.fillIntensity = 0.35;
+        this.fillColor = new Color3(0.3, 0.4, 0.58);
+
+        this.orbitBaseOffset = 14;
+        this.orbitSpacing = 11;
+        this.planetNightLift = new Color3(0.14, 0.14, 0.17);
+        break;
+
+      case StarType.BlackHole:
+        this.starBaseEmissiveScale = 0;
+        this.starDetailEmissiveScale = 0;
+        this.starDetailTextureLevel = 0;
+        this.starDetailAlpha = 0;
+        this.starCoronaScale = 1.0;
+        this.starCoronaAlpha = 0;
+        this.systemScaleMultiplier = 0.9;
+
+        this.starRotationSpeed = 0;
+        this.starDetailRotationSpeed = 0;
+        this.starDetailTiltSpeed = 0;
+
+        this.glowBaseIntensity = 1.25;
+        this.glowPulseAmplitude = 0.16;
+        this.glowPulseSpeed = 1.1;
+
+        this.ambientIntensity = 0.14;
+        this.bounceIntensity = 0.05;
+        this.starLightIntensity = 1.25;
+        this.starLightRange = 280;
+        this.fillIntensity = 0.55;
+        this.fillColor = new Color3(0.42, 0.34, 0.28);
+
+        this.orbitBaseOffset = 20;
+        this.orbitSpacing = 14;
+        this.planetNightLift = new Color3(0.18, 0.18, 0.2);
+        break;
+    }
+  }
+
+  private setupBackground(): void {
+    const bgSphere = MeshBuilder.CreateSphere(
+      "systemBackground",
+      { diameter: 4000, segments: 20 },
+      this.scene,
+    );
+    const bgMat = new StandardMaterial("systemBackgroundMat", this.scene);
+    bgMat.emissiveTexture = new Texture("/textures/galaxy_bg.png", this.scene);
+    bgMat.disableLighting = true;
+    bgMat.backFaceCulling = false;
+    bgSphere.material = bgMat;
+    bgSphere.isPickable = false;
+    bgSphere.infiniteDistance = true;
+  }
+
+  private setupCamera(canvas: HTMLCanvasElement): void {
+    this.camera = new ArcRotateCamera(
+      "systemCamera",
+      -Math.PI / 2,
+      Math.PI / 2.6,
+      65,
+      Vector3.Zero(),
+      this.scene,
+    );
+
+    this.camera.attachControl(canvas, true);
+    this.camera.lowerRadiusLimit = 12;
+    this.camera.upperRadiusLimit = 260;
+    this.camera.lowerBetaLimit = 0.12;
+    this.camera.upperBetaLimit = Math.PI / 2.05;
+    this.camera.wheelDeltaPercentage = 0.06;
+    this.camera.inertia = 0.84;
+
+    this.camera.panningSensibility = 0;
+    this.camera.keysUp = [];
+    this.camera.keysDown = [];
+    this.camera.keysLeft = [];
+    this.camera.keysRight = [];
+  }
+
+  private setupLighting(): void {
+    const hemi = new HemisphericLight("systemAmbient", new Vector3(0, 1, 0), this.scene);
+    hemi.intensity = this.ambientIntensity;
+    hemi.diffuse = new Color3(0.45, 0.48, 0.55);
+    hemi.specular = new Color3(0.25, 0.25, 0.3);
+
+    const bounce = new HemisphericLight("systemBounce", new Vector3(0, -1, 0), this.scene);
+    bounce.intensity = this.bounceIntensity;
+    bounce.diffuse = new Color3(0.2, 0.22, 0.26);
+    bounce.specular = new Color3(0.05, 0.05, 0.08);
+
+    const starLightColor =
+      this.starKind === "black-hole"
+        ? new Color3(1.0, 0.82, 0.56)
+        : new Color3(this.star.color[0], this.star.color[1], this.star.color[2]);
+
+    this.starLight = new PointLight("systemStarLight", Vector3.Zero(), this.scene);
+    this.starLight.intensity = this.starLightIntensity;
+    this.starLight.range = this.starLightRange;
+    this.starLight.diffuse = starLightColor;
+    this.starLight.specular = new Color3(0.8, 0.8, 0.85);
+
+    this.fillLight = new PointLight("systemFillLight", new Vector3(0, -28, 0), this.scene);
+    this.fillLight.intensity = this.fillIntensity;
+    this.fillLight.range = 320;
+    this.fillLight.diffuse = this.fillColor;
+
+    this.glowLayer = new GlowLayer("systemGlow", this.scene, {
+      mainTextureFixedSize: 1024,
+      blurKernelSize: 48,
+    });
+    this.glowLayer.intensity = this.glowBaseIntensity;
+  }
+
+  private buildSystemObjects(): void {
+    const typeCfg = STAR_TYPES[this.star.type];
+    const starTint = new Color3(this.star.color[0], this.star.color[1], this.star.color[2]);
+    const starDiameter = Math.max(1.2, typeCfg.systemDiameter * this.systemScaleMultiplier);
+
+    this.starMesh = MeshBuilder.CreateSphere(
+      "systemStar",
+      { diameter: starDiameter, segments: 40 },
+      this.scene,
+    );
+
+    const starBaseMat = new StandardMaterial("systemStarBaseMat", this.scene);
+    starBaseMat.emissiveColor =
+      this.starKind === "black-hole"
+        ? Color3.Black()
+        : starTint.scale(this.starBaseEmissiveScale);
+    starBaseMat.diffuseColor = Color3.Black();
+    starBaseMat.specularColor = Color3.Black();
+    starBaseMat.disableLighting = true;
+    this.starMesh.material = starBaseMat;
+    this.starMesh.isPickable = false;
+
+    this.starDetailMesh = MeshBuilder.CreateSphere(
+      "systemStarDetail",
+      { diameter: starDiameter * 1.008, segments: 40 },
+      this.scene,
+    );
+    this.starDetailMesh.parent = this.starMesh;
+
+    const detailMat = new StandardMaterial("systemStarDetailMat", this.scene);
+    if (this.starDetailTextureLevel > 0.01) {
+      detailMat.emissiveTexture = new Texture(this.detailTexturePath, this.scene);
+      detailMat.emissiveTexture.level = this.starDetailTextureLevel;
+    }
+    detailMat.emissiveColor =
+      this.starKind === "black-hole"
+        ? new Color3(0.05, 0.05, 0.06)
+        : starTint.scale(this.starDetailEmissiveScale);
+    detailMat.diffuseColor = Color3.Black();
+    detailMat.specularColor = Color3.Black();
+    detailMat.disableLighting = true;
+    detailMat.alpha = this.starDetailAlpha;
+    detailMat.backFaceCulling = false;
+    this.starDetailMesh.material = detailMat;
+    this.starDetailMesh.isPickable = false;
+
+    this.starCoronaMesh = MeshBuilder.CreateSphere(
+      "systemStarCorona",
+      { diameter: starDiameter * this.starCoronaScale, segments: 28 },
+      this.scene,
+    );
+    this.starCoronaMesh.parent = this.starMesh;
+
+    const coronaMat = new StandardMaterial("systemStarCoronaMat", this.scene);
+    coronaMat.emissiveColor =
+      this.starKind === "black-hole"
+        ? new Color3(0.05, 0.05, 0.07)
+        : starTint.scale(1.2);
+    coronaMat.diffuseColor = Color3.Black();
+    coronaMat.specularColor = Color3.Black();
+    coronaMat.disableLighting = true;
+    coronaMat.backFaceCulling = false;
+    coronaMat.alpha = this.starCoronaAlpha;
+    this.starCoronaMesh.material = coronaMat;
+    this.starCoronaMesh.isPickable = false;
+
+    if (this.starKind !== "black-hole") {
+      this.glowLayer.addIncludedOnlyMesh(this.starMesh);
+      this.glowLayer.addIncludedOnlyMesh(this.starDetailMesh);
+      if (this.starCoronaAlpha > 0.01) {
+        this.glowLayer.addIncludedOnlyMesh(this.starCoronaMesh);
+      }
+    }
+
+    if (this.starKind === "red-giant") {
+      this.createRedGiantAtmosphere(starDiameter, starTint);
+    }
+    if (this.starKind === "pulsar") {
+      this.createPulsarBeams(starDiameter, starTint);
+    }
+    if (this.starKind === "black-hole") {
+      this.createBlackHoleFeatures(starDiameter);
+    }
+
+    const planets =
+      this.star.system.planets.length > 0
+        ? this.star.system.planets
+        : this.createFallbackPlanets(this.starKind);
+
+    for (let i = 0; i < planets.length; i++) {
+      this.createPlanet(i, planets[i]);
+    }
+  }
+
+  private createRedGiantAtmosphere(starDiameter: number, starTint: Color3): void {
+    if (!this.starMesh) return;
+
+    const haze = MeshBuilder.CreateSphere(
+      "redGiantHaze",
+      { diameter: starDiameter * 1.5, segments: 24 },
+      this.scene,
+    );
+    haze.parent = this.starMesh;
+    haze.isPickable = false;
+
+    const hazeMat = new StandardMaterial("redGiantHazeMat", this.scene);
+    hazeMat.emissiveColor = starTint.scale(0.9);
+    hazeMat.diffuseColor = Color3.Black();
+    hazeMat.specularColor = Color3.Black();
+    hazeMat.disableLighting = true;
+    hazeMat.backFaceCulling = false;
+    hazeMat.alpha = 0.22;
+    haze.material = hazeMat;
+
+    this.glowLayer.addIncludedOnlyMesh(haze);
+  }
+
+  private createPulsarBeams(starDiameter: number, starTint: Color3): void {
+    if (!this.starMesh) return;
+
+    this.pulsarBeamPivot = new TransformNode("pulsarBeamPivot", this.scene);
+    this.pulsarBeamPivot.parent = this.starMesh;
+
+    const beamLength = Math.max(18, starDiameter * 18);
+    const beamRadius = Math.max(0.08, starDiameter * 0.24);
+
+    const beamMat = new StandardMaterial("pulsarBeamMat", this.scene);
+    beamMat.emissiveColor = new Color3(
+      Math.min(1, starTint.r * 0.5 + 0.45),
+      Math.min(1, starTint.g * 0.7 + 0.45),
+      1,
+    ).scale(1.8);
+    beamMat.diffuseColor = Color3.Black();
+    beamMat.specularColor = Color3.Black();
+    beamMat.disableLighting = true;
+    beamMat.alpha = 0.45;
+    beamMat.backFaceCulling = false;
+    this.pulsarBeamMaterial = beamMat;
+
+    const upBeam = MeshBuilder.CreateCylinder(
+      "pulsarBeamUp",
+      {
+        height: beamLength,
+        diameterTop: 0.01,
+        diameterBottom: beamRadius,
+        tessellation: 18,
+      },
+      this.scene,
+    );
+    upBeam.parent = this.pulsarBeamPivot;
+    upBeam.position.y = beamLength * 0.5 + starDiameter * 0.65;
+    upBeam.material = beamMat;
+    upBeam.isPickable = false;
+
+    const downBeam = MeshBuilder.CreateCylinder(
+      "pulsarBeamDown",
+      {
+        height: beamLength,
+        diameterTop: 0.01,
+        diameterBottom: beamRadius,
+        tessellation: 18,
+      },
+      this.scene,
+    );
+    downBeam.parent = this.pulsarBeamPivot;
+    downBeam.position.y = -beamLength * 0.5 - starDiameter * 0.65;
+    downBeam.rotation.z = Math.PI;
+    downBeam.material = beamMat;
+    downBeam.isPickable = false;
+
+    this.glowLayer.addIncludedOnlyMesh(upBeam);
+    this.glowLayer.addIncludedOnlyMesh(downBeam);
+  }
+
+  private createBlackHoleFeatures(starDiameter: number): void {
+    if (!this.starMesh) return;
+
+    const outerDisk = MeshBuilder.CreateTorus(
+      "blackHoleDiskOuter",
+      {
+        diameter: starDiameter * 4.8,
+        thickness: starDiameter * 0.85,
+        tessellation: 72,
+      },
+      this.scene,
+    );
+    outerDisk.parent = this.starMesh;
+    outerDisk.rotation.x = Math.PI / 2.35;
+    outerDisk.isPickable = false;
+
+    const outerMat = new StandardMaterial("blackHoleDiskOuterMat", this.scene);
+    outerMat.emissiveTexture = new Texture("/textures/star_surface.png", this.scene);
+    outerMat.emissiveTexture.level = 2.0;
+    outerMat.emissiveColor = new Color3(1.2, 0.78, 0.4);
+    outerMat.diffuseColor = Color3.Black();
+    outerMat.specularColor = Color3.Black();
+    outerMat.disableLighting = true;
+    outerMat.backFaceCulling = false;
+    outerMat.alpha = 0.92;
+    outerDisk.material = outerMat;
+
+    const innerDisk = MeshBuilder.CreateTorus(
+      "blackHoleDiskInner",
+      {
+        diameter: starDiameter * 3.3,
+        thickness: starDiameter * 0.38,
+        tessellation: 64,
+      },
+      this.scene,
+    );
+    innerDisk.parent = this.starMesh;
+    innerDisk.rotation.x = Math.PI / 2.35;
+    innerDisk.isPickable = false;
+
+    const innerMat = new StandardMaterial("blackHoleDiskInnerMat", this.scene);
+    innerMat.emissiveColor = new Color3(0.72, 0.86, 1.0).scale(1.35);
+    innerMat.diffuseColor = Color3.Black();
+    innerMat.specularColor = Color3.Black();
+    innerMat.disableLighting = true;
+    innerMat.backFaceCulling = false;
+    innerMat.alpha = 0.56;
+    innerDisk.material = innerMat;
+
+    const lensRing = MeshBuilder.CreateTorus(
+      "blackHoleLensRing",
+      {
+        diameter: starDiameter * 2.15,
+        thickness: starDiameter * 0.12,
+        tessellation: 56,
+      },
+      this.scene,
+    );
+    lensRing.parent = this.starMesh;
+    lensRing.rotation.x = Math.PI / 2.35;
+    lensRing.isPickable = false;
+
+    const lensMat = new StandardMaterial("blackHoleLensRingMat", this.scene);
+    lensMat.emissiveColor = new Color3(0.9, 0.92, 1.0);
+    lensMat.diffuseColor = Color3.Black();
+    lensMat.specularColor = Color3.Black();
+    lensMat.disableLighting = true;
+    lensMat.backFaceCulling = false;
+    lensMat.alpha = 0.38;
+    lensRing.material = lensMat;
+
+    const jetMat = new StandardMaterial("blackHoleJetMat", this.scene);
+    jetMat.emissiveColor = new Color3(0.65, 0.78, 1.0).scale(1.4);
+    jetMat.diffuseColor = Color3.Black();
+    jetMat.specularColor = Color3.Black();
+    jetMat.disableLighting = true;
+    jetMat.backFaceCulling = false;
+    jetMat.alpha = 0.24;
+
+    const jetLength = starDiameter * 9;
+    const jetRadius = Math.max(0.04, starDiameter * 0.16);
+
+    const topJet = MeshBuilder.CreateCylinder(
+      "blackHoleJetTop",
+      {
+        height: jetLength,
+        diameterTop: 0.01,
+        diameterBottom: jetRadius,
+        tessellation: 16,
+      },
+      this.scene,
+    );
+    topJet.parent = this.starMesh;
+    topJet.position.y = jetLength * 0.5 + starDiameter * 0.6;
+    topJet.material = jetMat;
+    topJet.isPickable = false;
+
+    const bottomJet = MeshBuilder.CreateCylinder(
+      "blackHoleJetBottom",
+      {
+        height: jetLength,
+        diameterTop: 0.01,
+        diameterBottom: jetRadius,
+        tessellation: 16,
+      },
+      this.scene,
+    );
+    bottomJet.parent = this.starMesh;
+    bottomJet.position.y = -jetLength * 0.5 - starDiameter * 0.6;
+    bottomJet.rotation.z = Math.PI;
+    bottomJet.material = jetMat;
+    bottomJet.isPickable = false;
+
+    this.blackHoleDiskOuter = outerDisk;
+    this.blackHoleDiskInner = innerDisk;
+
+    this.glowLayer.addIncludedOnlyMesh(outerDisk);
+    this.glowLayer.addIncludedOnlyMesh(innerDisk);
+    this.glowLayer.addIncludedOnlyMesh(lensRing);
+    this.glowLayer.addIncludedOnlyMesh(topJet);
+    this.glowLayer.addIncludedOnlyMesh(bottomJet);
+  }
+
+  private createPlanet(index: number, planet: PlanetConfig): void {
+    const textureByType: Record<PlanetConfig["type"], string> = {
+      rocky: "/textures/rocky_planet.png",
+      gas: "/textures/gas_giant.png",
+      ice: "/textures/ice_planet.png",
+    };
+
+    const orbitRadius = this.orbitBaseOffset + index * this.orbitSpacing + planet.orbitRadius * 1.2;
+    const orbitSpeed = planet.orbitSpeed * 0.35;
+    const diameter = Math.max(0.8, planet.diameter * 1.2);
+
+    const mesh = MeshBuilder.CreateSphere(
+      `systemPlanet_${index}`,
+      { diameter, segments: 28 },
+      this.scene,
+    );
+
+    const mat = new StandardMaterial(`systemPlanetMat_${index}`, this.scene);
+    mat.diffuseTexture = new Texture(textureByType[planet.type], this.scene);
+    mat.specularColor = new Color3(0.12, 0.12, 0.12);
+    mat.emissiveColor = this.planetNightLift;
+    mesh.material = mat;
+    mesh.isPickable = false;
+
+    this.createOrbitRing(index, orbitRadius);
+
+    this.orbitSystem.addBody({
+      mesh,
+      orbitRadius,
+      orbitSpeed,
+      currentAngle: Math.random() * Math.PI * 2,
+      axialRotationSpeed: 0.18 + Math.random() * 0.22,
+    });
+  }
+
+  private createOrbitRing(index: number, radius: number): void {
+    const points: Vector3[] = [];
+    const segments = 144;
+    const dashCount = Math.max(18, Math.round(radius * 0.4));
+    const ringY = 0.03;
+
+    for (let i = 0; i <= segments; i++) {
+      const t = (i / segments) * Math.PI * 2;
+      points.push(new Vector3(Math.cos(t) * radius, ringY, Math.sin(t) * radius));
+    }
+
+    const ring = MeshBuilder.CreateDashedLines(
+      `systemOrbitRing_${index}`,
+      {
+        points,
+        dashSize: 3.4,
+        gapSize: 4.2,
+        dashNb: dashCount,
+      },
+      this.scene,
+    );
+    ring.color = new Color3(0.74, 0.74, 0.78);
+    ring.alpha = 0.32;
+    ring.renderingGroupId = 1;
+    ring.alwaysSelectAsActiveMesh = true;
+    ring.isPickable = false;
+    this.orbitRings.push(ring);
+  }
+
+  private createFallbackPlanets(kind: StarVisualKind): PlanetConfig[] {
+    if (kind === "black-hole") {
+      return [
+        { type: "rocky", diameter: 1.2, orbitRadius: 12, orbitSpeed: 0.32 },
+        { type: "gas", diameter: 2.8, orbitRadius: 20, orbitSpeed: 0.2 },
+      ];
+    }
+    if (kind === "neutron-star" || kind === "pulsar") {
+      return [
+        { type: "rocky", diameter: 1.0, orbitRadius: 9, orbitSpeed: 0.62 },
+        { type: "ice", diameter: 1.1, orbitRadius: 15, orbitSpeed: 0.46 },
+      ];
+    }
+    return [
+      { type: "rocky", diameter: 1.4, orbitRadius: 7, orbitSpeed: 0.55 },
+      { type: "gas", diameter: 3.2, orbitRadius: 12, orbitSpeed: 0.24 },
+      { type: "ice", diameter: 1.1, orbitRadius: 18, orbitSpeed: 0.4 },
+    ];
+  }
+
+  private requestExit(): void {
+    if (this.isExiting) return;
+    this.isExiting = true;
+    Promise.resolve(this.onExitSystem())
+      .catch((err) => console.error("Failed to exit system view", err))
+      .finally(() => {
+        this.isExiting = false;
+      });
+  }
+
+  dispose(): void {
+    window.removeEventListener("keydown", this.onEscapeKey);
+    this.orbitSystem.dispose();
+    this.camera?.detachControl();
+    this.scene.dispose();
+  }
+}
