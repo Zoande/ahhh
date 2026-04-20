@@ -90,11 +90,11 @@ export interface GalaxyMapConfig {
 }
 
 export const GALAXY_MAP: GalaxyMapConfig = {
-  width: 3000,
-  height: 2000,
-  starCount: 1000,
+  width: 1500,
+  height: 1000,
+  starCount: 500,
   seed: 42,
-  minStarSpacing: 40,
+  minStarSpacing: 24,
 
   shape: {
     innerRadiusFraction: 0.25,
@@ -106,8 +106,8 @@ export const GALAXY_MAP: GalaxyMapConfig = {
 
   camera: {
     minRadius: 2,
-    maxRadius: 1600,
-    startRadius: 1600,
+    maxRadius: 900,
+    startRadius: 900,
     startAlpha: -Math.PI / 2,
     startBeta: Math.PI / 4,
     minBeta: 0.1,
@@ -120,7 +120,7 @@ export const GALAXY_MAP: GalaxyMapConfig = {
     systemFadeStart: 30,
     systemFadeEnd: 12,
     focusDistance: 18,
-    systemBorderRadius: 30,
+    systemBorderRadius: 20,
     systemScaleAtEntry: 0.15,
     systemFullScaleRadius: 3,
 
@@ -130,7 +130,7 @@ export const GALAXY_MAP: GalaxyMapConfig = {
     focusDistanceOut: 45,
 
     // Neighbor suppression
-    suppressionRadius: 120,
+    suppressionRadius: 80,
     suppressionStartBlend: 0.05,
     suppressionMinAlpha: 0.04,
     suppressionShrinkFactor: 0.25,
