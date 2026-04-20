@@ -59,6 +59,408 @@ const HYPERLANE_ENDPOINT_ALPHA_FACTOR = 0.14;
 const HYPERLANE_STAR_ENDPOINT_OFFSET_FACTOR = 0.2;
 const HYPERLANE_STAR_ENDPOINT_OFFSET_MIN = 4;
 const HYPERLANE_STAR_ENDPOINT_OFFSET_MAX = 10;
+const OWNERSHIP_FACTION_COUNT = 15;
+const OWNERSHIP_TEXTURE_SIZE = 1600;
+const OWNERSHIP_FILL_ALPHA = 0.12;
+const OWNERSHIP_BORDER_ALPHA = 0.95;
+const OWNERSHIP_BORDER_SOFT_ALPHA = 0.54;
+const OWNERSHIP_OVERLAY_Y = 0.055;
+const OWNERSHIP_TIE_EPSILON = 0.0001;
+const OWNERSHIP_SPLIT_DISTANCE_EPSILON = 0.8;
+
+const OWNERSHIP_COLOR_BANK: Array<[number, number, number]> = [
+  [224, 83, 83],
+  [230, 128, 74],
+  [216, 172, 79],
+  [186, 196, 86],
+  [123, 185, 85],
+  [77, 183, 121],
+  [66, 176, 152],
+  [74, 171, 219],
+  [92, 132, 222],
+  [121, 106, 216],
+  [158, 102, 204],
+  [194, 98, 188],
+  [217, 97, 152],
+  [213, 109, 121],
+  [173, 130, 102],
+  [145, 170, 191],
+  [130, 158, 95],
+  [193, 146, 86],
+  [173, 104, 86],
+  [122, 144, 186],
+  [94, 162, 206],
+  [119, 188, 161],
+  [178, 187, 107],
+  [206, 125, 164],
+];
+
+function pickOwnershipPalette(factionCount: number, rng: () => number): Color3[] {
+  const available = OWNERSHIP_COLOR_BANK.slice();
+  for (let i = available.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    const temp = available[i];
+    available[i] = available[j];
+    available[j] = temp;
+  }
+
+  const palette: Color3[] = [];
+  for (let i = 0; i < factionCount; i++) {
+    const [r, g, b] = available[i % available.length];
+    const jitter = (rng() - 0.5) * 0.07;
+    palette.push(
+      new Color3(
+        clamp(r / 255 + jitter, 0.08, 1),
+        clamp(g / 255 + jitter, 0.08, 1),
+        clamp(b / 255 + jitter, 0.08, 1),
+      ),
+    );
+  }
+  return palette;
+}
+
+function selectOwnershipSeedIndices(
+  stars: StarData[],
+  factionCount: number,
+  mapWidth: number,
+  mapHeight: number,
+  rng: () => number,
+): number[] {
+  const targetCount = Math.max(0, Math.min(factionCount, stars.length));
+  if (targetCount === 0) return [];
+
+  const seeds: number[] = [];
+  const used = new Set<number>();
+
+  for (let i = 0; i < targetCount; i++) {
+    const startX = (rng() - 0.5) * mapWidth;
+    const startZ = (rng() - 0.5) * mapHeight;
+    let bestIndex = -1;
+    let bestDistanceSq = Number.POSITIVE_INFINITY;
+
+    for (let starIndex = 0; starIndex < stars.length; starIndex++) {
+      if (used.has(starIndex)) continue;
+      const dx = stars[starIndex].x - startX;
+      const dz = stars[starIndex].z - startZ;
+      const distanceSq = dx * dx + dz * dz;
+      if (distanceSq < bestDistanceSq) {
+        bestDistanceSq = distanceSq;
+        bestIndex = starIndex;
+      }
+    }
+
+    if (bestIndex >= 0) {
+      used.add(bestIndex);
+      seeds.push(bestIndex);
+    }
+  }
+
+  if (seeds.length < targetCount) {
+    for (let starIndex = 0; starIndex < stars.length && seeds.length < targetCount; starIndex++) {
+      if (used.has(starIndex)) continue;
+      used.add(starIndex);
+      seeds.push(starIndex);
+    }
+  }
+
+  return seeds;
+}
+
+function computeHyperlaneJumpDistances(adjacency: number[][], seedIndex: number): number[] {
+  const count = adjacency.length;
+  const distances = new Array<number>(count).fill(-1);
+  if (seedIndex < 0 || seedIndex >= count) return distances;
+
+  const queue: number[] = [seedIndex];
+  let head = 0;
+  distances[seedIndex] = 0;
+
+  while (head < queue.length) {
+    const current = queue[head++];
+    const nextDistance = distances[current] + 1;
+    const neighbors = adjacency[current] ?? [];
+    for (const neighbor of neighbors) {
+      if (neighbor < 0 || neighbor >= count) continue;
+      if (distances[neighbor] >= 0) continue;
+      distances[neighbor] = nextDistance;
+      queue.push(neighbor);
+    }
+  }
+
+  return distances;
+}
+
+function assignOwnershipToStars(
+  stars: StarData[],
+  seedIndices: number[],
+  adjacency: number[][],
+): number[] {
+  if (seedIndices.length === 0) return new Array<number>(stars.length).fill(-1);
+
+  // Ownership is determined by lane-jump distance from each faction seed.
+  // Factions that run out of reachable neighbors simply stop expanding.
+  const jumpMaps = seedIndices.map((seed) => computeHyperlaneJumpDistances(adjacency, seed));
+  const ownerByStar = new Array<number>(stars.length).fill(-1);
+
+  for (let starIndex = 0; starIndex < stars.length; starIndex++) {
+    let bestOwner = -1;
+    let bestJumps = Number.POSITIVE_INFINITY;
+    let bestSeedDistanceSq = Number.POSITIVE_INFINITY;
+
+    for (let ownerIndex = 0; ownerIndex < seedIndices.length; ownerIndex++) {
+      const jumps = jumpMaps[ownerIndex][starIndex];
+      if (jumps < 0) continue;
+
+      const seed = stars[seedIndices[ownerIndex]];
+      const star = stars[starIndex];
+      const dx = star.x - seed.x;
+      const dz = star.z - seed.z;
+      const distanceSq = dx * dx + dz * dz;
+
+      if (jumps < bestJumps) {
+        bestOwner = ownerIndex;
+        bestJumps = jumps;
+        bestSeedDistanceSq = distanceSq;
+        continue;
+      }
+
+      if (jumps === bestJumps) {
+        if (
+          distanceSq < bestSeedDistanceSq - OWNERSHIP_TIE_EPSILON
+          || (Math.abs(distanceSq - bestSeedDistanceSq) <= OWNERSHIP_TIE_EPSILON
+            && (bestOwner < 0 || ownerIndex < bestOwner))
+        ) {
+          bestOwner = ownerIndex;
+          bestJumps = jumps;
+          bestSeedDistanceSq = distanceSq;
+        }
+      }
+    }
+
+    ownerByStar[starIndex] = bestOwner;
+  }
+
+  return ownerByStar;
+}
+
+function computeOwnershipRadiusWorld(mapWidth: number, mapHeight: number, starCount: number): number {
+  const minAxis = Math.min(mapWidth, mapHeight);
+  const areaPerStar = (mapWidth * mapHeight) / Math.max(1, starCount);
+  const baseRadius = Math.sqrt(areaPerStar) * 0.88;
+  return clamp(baseRadius, minAxis * 0.022, minAxis * 0.085);
+}
+
+function createOwnershipOverlayTextureDataURL(
+  textureSize: number,
+  mapWidth: number,
+  mapHeight: number,
+  stars: StarData[],
+  ownerByStar: number[],
+  palette: Color3[],
+): string {
+  if (stars.length === 0 || ownerByStar.length === 0 || palette.length === 0) {
+    return "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADElEQVR42mP4z8AAAAMBAQAY0x6sAAAAAElFTkSuQmCC";
+  }
+
+  const mapAspect = mapWidth / Math.max(1, mapHeight);
+  const widthPx = mapAspect >= 1
+    ? textureSize
+    : Math.max(640, Math.round(textureSize * mapAspect));
+  const heightPx = mapAspect >= 1
+    ? Math.max(640, Math.round(textureSize / Math.max(0.001, mapAspect)))
+    : textureSize;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = widthPx;
+  canvas.height = heightPx;
+
+  const ctx = canvas.getContext("2d");
+  if (!ctx) {
+    return "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADElEQVR42mP4z8AAAAMBAQAY0x6sAAAAAElFTkSuQmCC";
+  }
+
+  const pixelCount = widthPx * heightPx;
+  const ownerMap = new Int16Array(pixelCount);
+  ownerMap.fill(-1);
+  const distanceSqMap = new Float32Array(pixelCount);
+  distanceSqMap.fill(Number.POSITIVE_INFINITY);
+  const influenceMap = new Float32Array(pixelCount);
+  const splitMap = new Uint8Array(pixelCount);
+
+  const pxPerWorldX = (widthPx - 1) / Math.max(1, mapWidth);
+  const pxPerWorldY = (heightPx - 1) / Math.max(1, mapHeight);
+  const avgPxPerWorld = (pxPerWorldX + pxPerWorldY) * 0.5;
+
+  const territoryRadiusWorld = computeOwnershipRadiusWorld(mapWidth, mapHeight, stars.length);
+  const territoryOuterRadiusPx = Math.max(4, territoryRadiusWorld * avgPxPerWorld * 1.18);
+  const outerRadiusSq = territoryOuterRadiusPx * territoryOuterRadiusPx;
+  const invOuterRadius = 1 / Math.max(0.001, territoryOuterRadiusPx);
+
+  for (let starIndex = 0; starIndex < stars.length; starIndex++) {
+    const owner = ownerByStar[starIndex] ?? -1;
+    if (owner < 0) continue;
+
+    const star = stars[starIndex];
+    const cx = (star.x / mapWidth + 0.5) * (widthPx - 1);
+    const cy = (0.5 - star.z / mapHeight) * (heightPx - 1);
+
+    const minX = Math.max(0, Math.floor(cx - territoryOuterRadiusPx));
+    const maxX = Math.min(widthPx - 1, Math.ceil(cx + territoryOuterRadiusPx));
+    const minY = Math.max(0, Math.floor(cy - territoryOuterRadiusPx));
+    const maxY = Math.min(heightPx - 1, Math.ceil(cy + territoryOuterRadiusPx));
+
+    for (let y = minY; y <= maxY; y++) {
+      const dy = y - cy;
+      for (let x = minX; x <= maxX; x++) {
+        const dx = x - cx;
+        const dSq = dx * dx + dy * dy;
+        if (dSq > outerRadiusSq) continue;
+
+        const distance = Math.sqrt(dSq);
+        const influenceLinear = clamp(1 - distance * invOuterRadius, 0, 1);
+        const influence = influenceLinear * influenceLinear;
+
+        const idx = y * widthPx + x;
+        const currentOwner = ownerMap[idx];
+        const currentDistanceSq = distanceSqMap[idx];
+
+        if (currentOwner < 0) {
+          ownerMap[idx] = owner;
+          distanceSqMap[idx] = dSq;
+          influenceMap[idx] = influence;
+          splitMap[idx] = 0;
+          continue;
+        }
+
+        if (currentOwner === owner) {
+          if (dSq < currentDistanceSq) {
+            distanceSqMap[idx] = dSq;
+            influenceMap[idx] = influence;
+          } else if (influence > influenceMap[idx]) {
+            influenceMap[idx] = influence;
+          }
+          splitMap[idx] = 0;
+          continue;
+        }
+
+        if (dSq < currentDistanceSq - OWNERSHIP_SPLIT_DISTANCE_EPSILON) {
+          ownerMap[idx] = owner;
+          distanceSqMap[idx] = dSq;
+          influenceMap[idx] = influence;
+          splitMap[idx] = 0;
+          continue;
+        }
+
+        if (Math.abs(dSq - currentDistanceSq) <= OWNERSHIP_SPLIT_DISTANCE_EPSILON) {
+          splitMap[idx] = 1;
+        }
+      }
+    }
+  }
+
+  const borderNearOffsets: Array<[number, number]> = [
+    [-1, 0],
+    [1, 0],
+    [0, -1],
+    [0, 1],
+    [-1, -1],
+    [1, -1],
+    [-1, 1],
+    [1, 1],
+  ];
+  const borderFarOffsets: Array<[number, number]> = [
+    [-2, 0],
+    [2, 0],
+    [0, -2],
+    [0, 2],
+    [-2, -1],
+    [-2, 1],
+    [2, -1],
+    [2, 1],
+    [-1, -2],
+    [1, -2],
+    [-1, 2],
+    [1, 2],
+  ];
+
+  const imageData = ctx.createImageData(widthPx, heightPx);
+  const pixels = imageData.data;
+  const fillAlphaByte = Math.round(255 * OWNERSHIP_FILL_ALPHA);
+  const borderStrongAlphaByte = Math.round(255 * OWNERSHIP_BORDER_ALPHA);
+  const borderSoftAlphaByte = Math.round(255 * OWNERSHIP_BORDER_SOFT_ALPHA);
+
+  const paletteRgb = palette.map((color) => ({
+    r: Math.round(clamp(color.r, 0, 1) * 255),
+    g: Math.round(clamp(color.g, 0, 1) * 255),
+    b: Math.round(clamp(color.b, 0, 1) * 255),
+  }));
+
+  for (let y = 0; y < heightPx; y++) {
+    for (let x = 0; x < widthPx; x++) {
+      const idx = y * widthPx + x;
+      const owner = ownerMap[idx];
+      if (owner < 0) continue;
+
+      let isStrongBorder = splitMap[idx] === 1;
+      let isSoftBorder = false;
+
+      for (const [ox, oy] of borderNearOffsets) {
+        const nx = x + ox;
+        const ny = y + oy;
+        if (nx < 0 || nx >= widthPx || ny < 0 || ny >= heightPx) {
+          isStrongBorder = true;
+          break;
+        }
+        if (ownerMap[ny * widthPx + nx] !== owner) {
+          isStrongBorder = true;
+          break;
+        }
+      }
+
+      if (!isStrongBorder) {
+        for (const [ox, oy] of borderFarOffsets) {
+          const nx = x + ox;
+          const ny = y + oy;
+          if (nx < 0 || nx >= widthPx || ny < 0 || ny >= heightPx) {
+            isSoftBorder = true;
+            break;
+          }
+          if (ownerMap[ny * widthPx + nx] !== owner) {
+            isSoftBorder = true;
+            break;
+          }
+        }
+      }
+
+      const color = paletteRgb[owner] ?? paletteRgb[0] ?? { r: 255, g: 255, b: 255 };
+      const baseR = color.r;
+      const baseG = color.g;
+      const baseB = color.b;
+      const influence = influenceMap[idx];
+
+      const pixelIndex = idx * 4;
+      if (isStrongBorder) {
+        pixels[pixelIndex] = Math.min(255, Math.round(baseR * 1.16 + 14));
+        pixels[pixelIndex + 1] = Math.min(255, Math.round(baseG * 1.16 + 14));
+        pixels[pixelIndex + 2] = Math.min(255, Math.round(baseB * 1.16 + 14));
+        pixels[pixelIndex + 3] = borderStrongAlphaByte;
+      } else if (isSoftBorder) {
+        pixels[pixelIndex] = Math.min(255, Math.round(baseR * 1.08 + 8));
+        pixels[pixelIndex + 1] = Math.min(255, Math.round(baseG * 1.08 + 8));
+        pixels[pixelIndex + 2] = Math.min(255, Math.round(baseB * 1.08 + 8));
+        pixels[pixelIndex + 3] = borderSoftAlphaByte;
+      } else {
+        pixels[pixelIndex] = baseR;
+        pixels[pixelIndex + 1] = baseG;
+        pixels[pixelIndex + 2] = baseB;
+        pixels[pixelIndex + 3] = Math.round(fillAlphaByte * clamp(0.32 + influence * 0.78, 0.22, 1));
+      }
+    }
+  }
+
+  ctx.putImageData(imageData, 0, 0);
+  return canvas.toDataURL("image/png");
+}
 
 function clamp(v: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, v));
@@ -574,8 +976,10 @@ export class GalaxyScene implements IGameScene {
   private stars: StarData[] = [];
   private clickPlane!: Mesh;
   private hyperlaneMesh: Mesh | null = null;
+  private ownershipOverlayMesh: Mesh | null = null;
   private hyperlanePairs: Array<[number, number]> = [];
   private hyperlaneAdjacency: number[][] = [];
+  private starOwnership: number[] = [];
   private galacticCoreMeshes: Mesh[] = [];
   private galacticCoreSpinSpeeds: number[] = [];
   private hoveredStarId = -1;
@@ -585,6 +989,7 @@ export class GalaxyScene implements IGameScene {
   private centerCloudVisible = true;
   private starsVisible = true;
   private bloomEnabled = true;
+  private ownershipVisible = true;
 
   private pointerObserver: Observer<PointerInfo> | null = null;
   private isNavigating = false;
@@ -680,6 +1085,7 @@ export class GalaxyScene implements IGameScene {
 
     this.setupGalacticCore(cfg.width, cfg.height);
     this.setupHyperlanes(cfg.width, cfg.height, cfg.shape, cfg.seed);
+    this.setupOwnershipLayer(cfg.width, cfg.height, cfg.seed);
 
     this.starField = new StarFieldRenderer(this.scene, this.stars);
 
@@ -801,6 +1207,63 @@ export class GalaxyScene implements IGameScene {
     this.hyperlaneMesh.visibility = this.hyperlanesVisible
       ? HYPERLANE_BASE_VISIBILITY + HYPERLANE_ZOOM_VISIBILITY_BOOST
       : 0;
+  }
+
+  private setupOwnershipLayer(width: number, height: number, seed: number): void {
+    if (this.stars.length === 0) return;
+
+    const factionCount = Math.min(OWNERSHIP_FACTION_COUNT, this.stars.length);
+    if (factionCount <= 0) return;
+
+    const rng = mulberry32(seed ^ 0x43a7f12d);
+    const seedIndices = selectOwnershipSeedIndices(
+      this.stars,
+      factionCount,
+      width,
+      height,
+      rng,
+    );
+    const palette = pickOwnershipPalette(seedIndices.length, rng);
+    this.starOwnership = assignOwnershipToStars(this.stars, seedIndices, this.hyperlaneAdjacency);
+
+    const textureDataURL = createOwnershipOverlayTextureDataURL(
+      OWNERSHIP_TEXTURE_SIZE,
+      width,
+      height,
+      this.stars,
+      this.starOwnership,
+      palette,
+    );
+
+    const overlay = MeshBuilder.CreateGround(
+      "galaxyOwnershipOverlay",
+      { width, height },
+      this.scene,
+    );
+    overlay.position.y = OWNERSHIP_OVERLAY_Y;
+    overlay.isPickable = false;
+    overlay.alwaysSelectAsActiveMesh = true;
+
+    const tex = new Texture(textureDataURL, this.scene, false, false, Texture.TRILINEAR_SAMPLINGMODE);
+    tex.hasAlpha = true;
+    tex.wrapU = Texture.CLAMP_ADDRESSMODE;
+    tex.wrapV = Texture.CLAMP_ADDRESSMODE;
+    tex.anisotropicFilteringLevel = 8;
+
+    const mat = new StandardMaterial("galaxyOwnershipOverlayMat", this.scene);
+    mat.diffuseTexture = tex;
+    mat.opacityTexture = tex;
+    mat.emissiveTexture = tex;
+    mat.diffuseColor = Color3.White();
+    mat.emissiveColor = Color3.White();
+    mat.specularColor = Color3.Black();
+    mat.disableLighting = true;
+    mat.backFaceCulling = false;
+    mat.alpha = 1;
+
+    overlay.material = mat;
+    overlay.setEnabled(this.ownershipVisible);
+    this.ownershipOverlayMesh = overlay;
   }
 
   private setupGalacticCore(width: number, height: number): void {
@@ -1011,6 +1474,11 @@ export class GalaxyScene implements IGameScene {
     this.bloomEnabled = enabled;
   }
 
+  setOwnershipVisible(visible: boolean): void {
+    this.ownershipVisible = visible;
+    this.ownershipOverlayMesh?.setEnabled(visible);
+  }
+
   captureViewState(): GalaxyViewState | null {
     if (!this.cam) return null;
 
@@ -1034,8 +1502,13 @@ export class GalaxyScene implements IGameScene {
     this.canvas?.removeEventListener("mouseleave", this.onCanvasPointerLeave);
     this.hyperlaneMesh?.dispose();
     this.hyperlaneMesh = null;
+    if (this.ownershipOverlayMesh) {
+      this.ownershipOverlayMesh.dispose(false, true);
+      this.ownershipOverlayMesh = null;
+    }
     this.hyperlanePairs = [];
     this.hyperlaneAdjacency = [];
+    this.starOwnership = [];
     this.hoveredStarId = -1;
     this.galacticCoreMeshes = [];
     this.galacticCoreSpinSpeeds = [];

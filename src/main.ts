@@ -27,6 +27,7 @@ async function boot() {
     bloom: true,
     centerCloud: true,
     stars: true,
+    ownership: true,
   };
 
   const resolveRoutingStars = (): StarData[] => {
@@ -73,6 +74,7 @@ async function boot() {
       activeGalaxyScene.setBloomEnabled(visualToggles.bloom);
       activeGalaxyScene.setCenterCloudVisible(visualToggles.centerCloud);
       activeGalaxyScene.setStarsVisible(visualToggles.stars);
+      activeGalaxyScene.setOwnershipVisible(visualToggles.ownership);
     }
 
     if (activeSystemScene) {

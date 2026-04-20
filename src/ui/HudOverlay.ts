@@ -1,4 +1,4 @@
-export type HudToggleKey = "hyperlanes" | "bloom" | "centerCloud" | "stars";
+export type HudToggleKey = "hyperlanes" | "bloom" | "centerCloud" | "stars" | "ownership";
 
 export type HudVisualToggles = Record<HudToggleKey, boolean>;
 
@@ -403,6 +403,7 @@ export class HudOverlay {
       bloom: createToggleButton("bloom", "Bloom"),
       centerCloud: createToggleButton("centerCloud", "Center Cloud"),
       stars: createToggleButton("stars", "Stars"),
+      ownership: createToggleButton("ownership", "Ownership"),
     };
 
     this.root.appendChild(bottom);
@@ -436,7 +437,7 @@ export class HudOverlay {
       }
     }
 
-    const toggleOrder: HudToggleKey[] = ["hyperlanes", "bloom", "centerCloud", "stars"];
+    const toggleOrder: HudToggleKey[] = ["hyperlanes", "bloom", "centerCloud", "stars", "ownership"];
     for (const key of toggleOrder) {
       const enabled = state.toggles[key];
       const btn = this.toggleButtons[key];
