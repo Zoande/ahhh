@@ -17,9 +17,11 @@ import {
 import type { AbstractEngine, Mesh, Observer, PointerInfo } from "@babylonjs/core";
 import type { IGameScene } from "../SceneManager";
 import { GALAXY_MAP } from "../data/GalaxyMap";
+import { getPlayerShipStarId } from "../data/PlayerShip";
 import { generateStarMap } from "../data/StarMap";
 import type { StarData } from "../data/StarMap";
 import { CameraController } from "../systems/CameraController";
+import { OwnershipOverlayRenderer } from "../systems/OwnershipOverlayRenderer";
 import { StarFieldRenderer } from "../systems/StarFieldRenderer";
 
 type EnterSystemHandler = (star: StarData) => void | Promise<void>;
@@ -60,13 +62,13 @@ const HYPERLANE_STAR_ENDPOINT_OFFSET_FACTOR = 0.2;
 const HYPERLANE_STAR_ENDPOINT_OFFSET_MIN = 4;
 const HYPERLANE_STAR_ENDPOINT_OFFSET_MAX = 10;
 const OWNERSHIP_FACTION_COUNT = 15;
-const OWNERSHIP_TEXTURE_SIZE = 1600;
-const OWNERSHIP_FILL_ALPHA = 0.12;
-const OWNERSHIP_BORDER_ALPHA = 0.95;
-const OWNERSHIP_BORDER_SOFT_ALPHA = 0.54;
+const OWNERSHIP_TEXTURE_SIZE = 2400;
+const OWNERSHIP_OVERLAY_PADDING_FACTOR = 0.16;
 const OWNERSHIP_OVERLAY_Y = 0.055;
 const OWNERSHIP_TIE_EPSILON = 0.0001;
-const OWNERSHIP_SPLIT_DISTANCE_EPSILON = 0.8;
+const STAR_PICK_RADIUS_MIN = 5.5;
+const STAR_PICK_RADIUS_MAX = 10;
+const STAR_PICK_RADIUS_CAMERA_FACTOR = 0.012;
 
 const OWNERSHIP_COLOR_BANK: Array<[number, number, number]> = [
   [224, 83, 83],
@@ -241,225 +243,6 @@ function assignOwnershipToStars(
   }
 
   return ownerByStar;
-}
-
-function computeOwnershipRadiusWorld(mapWidth: number, mapHeight: number, starCount: number): number {
-  const minAxis = Math.min(mapWidth, mapHeight);
-  const areaPerStar = (mapWidth * mapHeight) / Math.max(1, starCount);
-  const baseRadius = Math.sqrt(areaPerStar) * 0.88;
-  return clamp(baseRadius, minAxis * 0.022, minAxis * 0.085);
-}
-
-function createOwnershipOverlayTextureDataURL(
-  textureSize: number,
-  mapWidth: number,
-  mapHeight: number,
-  stars: StarData[],
-  ownerByStar: number[],
-  palette: Color3[],
-): string {
-  if (stars.length === 0 || ownerByStar.length === 0 || palette.length === 0) {
-    return "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADElEQVR42mP4z8AAAAMBAQAY0x6sAAAAAElFTkSuQmCC";
-  }
-
-  const mapAspect = mapWidth / Math.max(1, mapHeight);
-  const widthPx = mapAspect >= 1
-    ? textureSize
-    : Math.max(640, Math.round(textureSize * mapAspect));
-  const heightPx = mapAspect >= 1
-    ? Math.max(640, Math.round(textureSize / Math.max(0.001, mapAspect)))
-    : textureSize;
-
-  const canvas = document.createElement("canvas");
-  canvas.width = widthPx;
-  canvas.height = heightPx;
-
-  const ctx = canvas.getContext("2d");
-  if (!ctx) {
-    return "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADElEQVR42mP4z8AAAAMBAQAY0x6sAAAAAElFTkSuQmCC";
-  }
-
-  const pixelCount = widthPx * heightPx;
-  const ownerMap = new Int16Array(pixelCount);
-  ownerMap.fill(-1);
-  const distanceSqMap = new Float32Array(pixelCount);
-  distanceSqMap.fill(Number.POSITIVE_INFINITY);
-  const influenceMap = new Float32Array(pixelCount);
-  const splitMap = new Uint8Array(pixelCount);
-
-  const pxPerWorldX = (widthPx - 1) / Math.max(1, mapWidth);
-  const pxPerWorldY = (heightPx - 1) / Math.max(1, mapHeight);
-  const avgPxPerWorld = (pxPerWorldX + pxPerWorldY) * 0.5;
-
-  const territoryRadiusWorld = computeOwnershipRadiusWorld(mapWidth, mapHeight, stars.length);
-  const territoryOuterRadiusPx = Math.max(4, territoryRadiusWorld * avgPxPerWorld * 1.18);
-  const outerRadiusSq = territoryOuterRadiusPx * territoryOuterRadiusPx;
-  const invOuterRadius = 1 / Math.max(0.001, territoryOuterRadiusPx);
-
-  for (let starIndex = 0; starIndex < stars.length; starIndex++) {
-    const owner = ownerByStar[starIndex] ?? -1;
-    if (owner < 0) continue;
-
-    const star = stars[starIndex];
-    const cx = (star.x / mapWidth + 0.5) * (widthPx - 1);
-    const cy = (0.5 - star.z / mapHeight) * (heightPx - 1);
-
-    const minX = Math.max(0, Math.floor(cx - territoryOuterRadiusPx));
-    const maxX = Math.min(widthPx - 1, Math.ceil(cx + territoryOuterRadiusPx));
-    const minY = Math.max(0, Math.floor(cy - territoryOuterRadiusPx));
-    const maxY = Math.min(heightPx - 1, Math.ceil(cy + territoryOuterRadiusPx));
-
-    for (let y = minY; y <= maxY; y++) {
-      const dy = y - cy;
-      for (let x = minX; x <= maxX; x++) {
-        const dx = x - cx;
-        const dSq = dx * dx + dy * dy;
-        if (dSq > outerRadiusSq) continue;
-
-        const distance = Math.sqrt(dSq);
-        const influenceLinear = clamp(1 - distance * invOuterRadius, 0, 1);
-        const influence = influenceLinear * influenceLinear;
-
-        const idx = y * widthPx + x;
-        const currentOwner = ownerMap[idx];
-        const currentDistanceSq = distanceSqMap[idx];
-
-        if (currentOwner < 0) {
-          ownerMap[idx] = owner;
-          distanceSqMap[idx] = dSq;
-          influenceMap[idx] = influence;
-          splitMap[idx] = 0;
-          continue;
-        }
-
-        if (currentOwner === owner) {
-          if (dSq < currentDistanceSq) {
-            distanceSqMap[idx] = dSq;
-            influenceMap[idx] = influence;
-          } else if (influence > influenceMap[idx]) {
-            influenceMap[idx] = influence;
-          }
-          splitMap[idx] = 0;
-          continue;
-        }
-
-        if (dSq < currentDistanceSq - OWNERSHIP_SPLIT_DISTANCE_EPSILON) {
-          ownerMap[idx] = owner;
-          distanceSqMap[idx] = dSq;
-          influenceMap[idx] = influence;
-          splitMap[idx] = 0;
-          continue;
-        }
-
-        if (Math.abs(dSq - currentDistanceSq) <= OWNERSHIP_SPLIT_DISTANCE_EPSILON) {
-          splitMap[idx] = 1;
-        }
-      }
-    }
-  }
-
-  const borderNearOffsets: Array<[number, number]> = [
-    [-1, 0],
-    [1, 0],
-    [0, -1],
-    [0, 1],
-    [-1, -1],
-    [1, -1],
-    [-1, 1],
-    [1, 1],
-  ];
-  const borderFarOffsets: Array<[number, number]> = [
-    [-2, 0],
-    [2, 0],
-    [0, -2],
-    [0, 2],
-    [-2, -1],
-    [-2, 1],
-    [2, -1],
-    [2, 1],
-    [-1, -2],
-    [1, -2],
-    [-1, 2],
-    [1, 2],
-  ];
-
-  const imageData = ctx.createImageData(widthPx, heightPx);
-  const pixels = imageData.data;
-  const fillAlphaByte = Math.round(255 * OWNERSHIP_FILL_ALPHA);
-  const borderStrongAlphaByte = Math.round(255 * OWNERSHIP_BORDER_ALPHA);
-  const borderSoftAlphaByte = Math.round(255 * OWNERSHIP_BORDER_SOFT_ALPHA);
-
-  const paletteRgb = palette.map((color) => ({
-    r: Math.round(clamp(color.r, 0, 1) * 255),
-    g: Math.round(clamp(color.g, 0, 1) * 255),
-    b: Math.round(clamp(color.b, 0, 1) * 255),
-  }));
-
-  for (let y = 0; y < heightPx; y++) {
-    for (let x = 0; x < widthPx; x++) {
-      const idx = y * widthPx + x;
-      const owner = ownerMap[idx];
-      if (owner < 0) continue;
-
-      let isStrongBorder = splitMap[idx] === 1;
-      let isSoftBorder = false;
-
-      for (const [ox, oy] of borderNearOffsets) {
-        const nx = x + ox;
-        const ny = y + oy;
-        if (nx < 0 || nx >= widthPx || ny < 0 || ny >= heightPx) {
-          isStrongBorder = true;
-          break;
-        }
-        if (ownerMap[ny * widthPx + nx] !== owner) {
-          isStrongBorder = true;
-          break;
-        }
-      }
-
-      if (!isStrongBorder) {
-        for (const [ox, oy] of borderFarOffsets) {
-          const nx = x + ox;
-          const ny = y + oy;
-          if (nx < 0 || nx >= widthPx || ny < 0 || ny >= heightPx) {
-            isSoftBorder = true;
-            break;
-          }
-          if (ownerMap[ny * widthPx + nx] !== owner) {
-            isSoftBorder = true;
-            break;
-          }
-        }
-      }
-
-      const color = paletteRgb[owner] ?? paletteRgb[0] ?? { r: 255, g: 255, b: 255 };
-      const baseR = color.r;
-      const baseG = color.g;
-      const baseB = color.b;
-      const influence = influenceMap[idx];
-
-      const pixelIndex = idx * 4;
-      if (isStrongBorder) {
-        pixels[pixelIndex] = Math.min(255, Math.round(baseR * 1.16 + 14));
-        pixels[pixelIndex + 1] = Math.min(255, Math.round(baseG * 1.16 + 14));
-        pixels[pixelIndex + 2] = Math.min(255, Math.round(baseB * 1.16 + 14));
-        pixels[pixelIndex + 3] = borderStrongAlphaByte;
-      } else if (isSoftBorder) {
-        pixels[pixelIndex] = Math.min(255, Math.round(baseR * 1.08 + 8));
-        pixels[pixelIndex + 1] = Math.min(255, Math.round(baseG * 1.08 + 8));
-        pixels[pixelIndex + 2] = Math.min(255, Math.round(baseB * 1.08 + 8));
-        pixels[pixelIndex + 3] = borderSoftAlphaByte;
-      } else {
-        pixels[pixelIndex] = baseR;
-        pixels[pixelIndex + 1] = baseG;
-        pixels[pixelIndex + 2] = baseB;
-        pixels[pixelIndex + 3] = Math.round(fillAlphaByte * clamp(0.32 + influence * 0.78, 0.22, 1));
-      }
-    }
-  }
-
-  ctx.putImageData(imageData, 0, 0);
-  return canvas.toDataURL("image/png");
 }
 
 function clamp(v: number, min: number, max: number): number {
@@ -977,9 +760,11 @@ export class GalaxyScene implements IGameScene {
   private clickPlane!: Mesh;
   private hyperlaneMesh: Mesh | null = null;
   private ownershipOverlayMesh: Mesh | null = null;
+  private ownershipRenderer: OwnershipOverlayRenderer | null = null;
   private hyperlanePairs: Array<[number, number]> = [];
   private hyperlaneAdjacency: number[][] = [];
   private starOwnership: number[] = [];
+  private playerShipStarId = -1;
   private galacticCoreMeshes: Mesh[] = [];
   private galacticCoreSpinSpeeds: number[] = [];
   private hoveredStarId = -1;
@@ -1033,6 +818,7 @@ export class GalaxyScene implements IGameScene {
           cfg.minStarSpacing,
           cfg.shape,
         );
+    this.playerShipStarId = getPlayerShipStarId(this.stars.length, cfg.seed);
 
     const initialViewState = this.options.initialViewState;
 
@@ -1088,6 +874,7 @@ export class GalaxyScene implements IGameScene {
     this.setupOwnershipLayer(cfg.width, cfg.height, cfg.seed);
 
     this.starField = new StarFieldRenderer(this.scene, this.stars);
+    this.starField.setPlayerShipStar(this.playerShipStarId);
 
     this.pointerObserver = this.scene.onPointerObservable.add((pointerInfo) => {
       if (pointerInfo.type === PointerEventTypes.POINTERMOVE) {
@@ -1120,6 +907,7 @@ export class GalaxyScene implements IGameScene {
     if (this.hoveredStarId >= 0 && this.hoveredStarId < this.stars.length) {
       this.starField.setStarScale(this.hoveredStarId, this.hoverScaleBoost);
     }
+    this.starField.setSelectionMarkerStar(this.hoveredStarId);
     this.starField.setZoomOutBlend(zoomOutBlend);
     this.starField.setStarsVisible(this.starsVisible);
     this.starField.setBloomEnabled(this.bloomEnabled);
@@ -1225,30 +1013,31 @@ export class GalaxyScene implements IGameScene {
     );
     const palette = pickOwnershipPalette(seedIndices.length, rng);
     this.starOwnership = assignOwnershipToStars(this.stars, seedIndices, this.hyperlaneAdjacency);
+    const ownershipPadding = Math.min(width, height) * OWNERSHIP_OVERLAY_PADDING_FACTOR;
+    const ownershipWidth = width + ownershipPadding * 2;
+    const ownershipHeight = height + ownershipPadding * 2;
 
-    const textureDataURL = createOwnershipOverlayTextureDataURL(
-      OWNERSHIP_TEXTURE_SIZE,
-      width,
-      height,
-      this.stars,
-      this.starOwnership,
+    this.ownershipRenderer = new OwnershipOverlayRenderer(this.scene, {
+      textureSize: OWNERSHIP_TEXTURE_SIZE,
+      mapWidth: ownershipWidth,
+      mapHeight: ownershipHeight,
+      territoryWidth: width,
+      territoryHeight: height,
+      stars: this.stars,
       palette,
-    );
+    });
+    this.ownershipRenderer.updateOwnership(this.starOwnership);
 
     const overlay = MeshBuilder.CreateGround(
       "galaxyOwnershipOverlay",
-      { width, height },
+      { width: ownershipWidth, height: ownershipHeight },
       this.scene,
     );
     overlay.position.y = OWNERSHIP_OVERLAY_Y;
     overlay.isPickable = false;
     overlay.alwaysSelectAsActiveMesh = true;
 
-    const tex = new Texture(textureDataURL, this.scene, false, false, Texture.TRILINEAR_SAMPLINGMODE);
-    tex.hasAlpha = true;
-    tex.wrapU = Texture.CLAMP_ADDRESSMODE;
-    tex.wrapV = Texture.CLAMP_ADDRESSMODE;
-    tex.anisotropicFilteringLevel = 8;
+    const tex = this.ownershipRenderer.texture;
 
     const mat = new StandardMaterial("galaxyOwnershipOverlayMat", this.scene);
     mat.diffuseTexture = tex;
@@ -1394,7 +1183,11 @@ export class GalaxyScene implements IGameScene {
 
     const clickX = pick.pickedPoint.x;
     const clickZ = pick.pickedPoint.z;
-    const pickRadius = Math.max(16, this.cam.radius * 0.035);
+    const pickRadius = clamp(
+      this.cam.radius * STAR_PICK_RADIUS_CAMERA_FACTOR,
+      STAR_PICK_RADIUS_MIN,
+      STAR_PICK_RADIUS_MAX,
+    );
     const pickRadiusSq = pickRadius * pickRadius;
 
     let nearestStar: StarData | null = null;
@@ -1479,6 +1272,20 @@ export class GalaxyScene implements IGameScene {
     this.ownershipOverlayMesh?.setEnabled(visible);
   }
 
+  setStarOwnership(starId: number, owner: number): void {
+    if (starId < 0 || starId >= this.starOwnership.length) return;
+    this.starOwnership[starId] = owner;
+    this.ownershipRenderer?.setStarOwner(starId, owner);
+  }
+
+  setStarOwnerships(ownerByStar: number[]): void {
+    this.starOwnership = ownerByStar.slice(0, this.stars.length);
+    while (this.starOwnership.length < this.stars.length) {
+      this.starOwnership.push(-1);
+    }
+    this.ownershipRenderer?.updateOwnership(this.starOwnership);
+  }
+
   captureViewState(): GalaxyViewState | null {
     if (!this.cam) return null;
 
@@ -1503,9 +1310,14 @@ export class GalaxyScene implements IGameScene {
     this.hyperlaneMesh?.dispose();
     this.hyperlaneMesh = null;
     if (this.ownershipOverlayMesh) {
-      this.ownershipOverlayMesh.dispose(false, true);
+      const ownershipMaterial = this.ownershipOverlayMesh.material;
+      this.ownershipOverlayMesh.material = null;
+      this.ownershipOverlayMesh.dispose();
+      ownershipMaterial?.dispose(false, false);
       this.ownershipOverlayMesh = null;
     }
+    this.ownershipRenderer?.dispose();
+    this.ownershipRenderer = null;
     this.hyperlanePairs = [];
     this.hyperlaneAdjacency = [];
     this.starOwnership = [];

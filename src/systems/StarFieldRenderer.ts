@@ -12,8 +12,18 @@
  * - Type-specific pulse behavior (notably pulsars)
  */
 
-import { SpriteManager, Sprite, Vector3, Color4 } from "@babylonjs/core";
-import type { Scene } from "@babylonjs/core";
+import {
+  SpriteManager,
+  Sprite,
+  Vector3,
+  Color3,
+  Color4,
+  MeshBuilder,
+  StandardMaterial,
+  TransformNode,
+  GlowLayer,
+} from "@babylonjs/core";
+import type { Mesh, Scene } from "@babylonjs/core";
 import { STAR_TYPES, StarType } from "../data/StarMap";
 import type { StarData } from "../data/StarMap";
 
@@ -79,6 +89,29 @@ const SUBTLE_PULSE_FLOOR = 0.85;
 const STRONG_PULSE_SPEED_SCALE = 0.22;
 const SUBTLE_PULSE_SPEED_SCALE = 0.6;
 
+const SELECTION_MARKER_Y = 0.72;
+const SELECTION_MARKER_RADIUS = 15;
+const SELECTION_RECT_WIDTH = 8.4;
+const SELECTION_RECT_HEIGHT = 4.4;
+const SELECTION_RECT_THICKNESS = 0.9;
+const SELECTION_MARKER_ALPHA_MIN = 0.34;
+const SELECTION_MARKER_ALPHA_MAX = 0.54;
+const SELECTION_MARKER_PULSE_SPEED = 4.2;
+const SELECTION_MARKER_ROTATION_SPEED = 0.34;
+const SELECTION_MARKER_SCALE_PULSE = 0.035;
+const SELECTION_MARKER_EMISSIVE_MIN = 1.4;
+const SELECTION_MARKER_EMISSIVE_MAX = 2.4;
+const SELECTION_MARKER_GLOW_MIN = 0.32;
+const SELECTION_MARKER_GLOW_MAX = 0.68;
+const SELECTION_MARKER_COLOR = new Color3(0.18, 1.0, 0.9);
+
+const PLAYER_SHIP_ICON_TEXTURE_SIZE = 1024;
+const PLAYER_SHIP_ICON_MIN_SIZE = 14;
+const PLAYER_SHIP_ICON_MAX_SIZE = 27;
+const PLAYER_SHIP_ICON_Y = 2.4;
+const PLAYER_SHIP_ICON_PULSE_SPEED = 2.3;
+const PLAYER_SHIP_ICON_PULSE_SCALE = 0.09;
+
 function clamp01(v: number): number {
   return Math.max(0, Math.min(1, v));
 }
@@ -127,6 +160,56 @@ function createRadialTextureDataURL(
   return canvas.toDataURL("image/png");
 }
 
+function createSelectionMarkerMaterial(scene: Scene): StandardMaterial {
+  const mat = new StandardMaterial("starSelectionMarkerMat", scene);
+  mat.diffuseColor = SELECTION_MARKER_COLOR.scale(0.16);
+  mat.emissiveColor = SELECTION_MARKER_COLOR.scale(SELECTION_MARKER_EMISSIVE_MAX);
+  mat.specularColor = Color3.Black();
+  mat.disableLighting = true;
+  mat.backFaceCulling = false;
+  mat.alpha = SELECTION_MARKER_ALPHA_MAX;
+  mat.alphaMode = 2; // ALPHA_COMBINE
+  return mat;
+}
+
+function createSelectionMarkerBoxes(
+  scene: Scene,
+  parent: TransformNode,
+  material: StandardMaterial,
+): Mesh[] {
+  const meshes: Mesh[] = [];
+  const angles = [-Math.PI / 2, Math.PI / 6, (Math.PI * 5) / 6];
+
+  for (let i = 0; i < angles.length; i++) {
+    const angle = angles[i];
+    const radialX = Math.cos(angle);
+    const radialZ = Math.sin(angle);
+
+    const box = MeshBuilder.CreateBox(
+      `starSelectionMarkerRect_${i}`,
+      {
+        width: SELECTION_RECT_WIDTH,
+        height: SELECTION_RECT_THICKNESS,
+        depth: SELECTION_RECT_HEIGHT,
+      },
+      scene,
+    );
+    box.parent = parent;
+    box.position.set(
+      radialX * SELECTION_MARKER_RADIUS,
+      0,
+      radialZ * SELECTION_MARKER_RADIUS,
+    );
+    box.rotation.y = -angle - Math.PI / 2;
+    box.material = material;
+    box.isPickable = false;
+    box.alwaysSelectAsActiveMesh = true;
+    meshes.push(box);
+  }
+
+  return meshes;
+}
+
 export class StarFieldRenderer {
   private haloManager: SpriteManager;
   private coreManager: SpriteManager;
@@ -136,6 +219,14 @@ export class StarFieldRenderer {
   private baseCoreSizes: number[] = [];
   private baseHaloSizes: number[] = [];
   private starPositions: Array<{ x: number; z: number }> = [];
+  private selectionMarkerRoot: TransformNode;
+  private selectionMarkerMeshes: Mesh[] = [];
+  private selectionMarkerMaterial: StandardMaterial;
+  private selectionGlowLayer: GlowLayer;
+  private selectionMarkerStarId = -1;
+  private playerShipIconManager: SpriteManager;
+  private playerShipIconSprite: Sprite;
+  private playerShipStarId = -1;
 
   // Current per-star overrides (applied each frame via applyVisuals)
   private alphaOverrides: Float32Array;
@@ -186,6 +277,39 @@ export class StarFieldRenderer {
 
     this.haloManager.blendMode = SPRITE_BLEND_ADD;
     this.coreManager.blendMode = SPRITE_BLEND_ADD;
+
+    this.selectionMarkerRoot = new TransformNode("starSelectionMarker", scene);
+    this.selectionMarkerMaterial = createSelectionMarkerMaterial(scene);
+    this.selectionGlowLayer = new GlowLayer("starSelectionMarkerGlow", scene, {
+      blurKernelSize: 28,
+      mainTextureRatio: 0.35,
+    });
+    this.selectionGlowLayer.intensity = SELECTION_MARKER_GLOW_MAX;
+    this.selectionMarkerMeshes = createSelectionMarkerBoxes(
+      scene,
+      this.selectionMarkerRoot,
+      this.selectionMarkerMaterial,
+    );
+    for (const mesh of this.selectionMarkerMeshes) {
+      this.selectionGlowLayer.addIncludedOnlyMesh(mesh);
+    }
+    this.selectionMarkerRoot.setEnabled(false);
+
+    this.playerShipIconManager = new SpriteManager(
+      "playerShipIconSprites",
+      "/textures/own_ship_icon.png",
+      1,
+      {
+        width: PLAYER_SHIP_ICON_TEXTURE_SIZE,
+        height: PLAYER_SHIP_ICON_TEXTURE_SIZE,
+      },
+      scene,
+    );
+    this.playerShipIconManager.isPickable = false;
+    this.playerShipIconManager.fogEnabled = false;
+    this.playerShipIconSprite = new Sprite("player_ship_icon", this.playerShipIconManager);
+    this.playerShipIconSprite.isVisible = false;
+    this.playerShipIconSprite.position.y = PLAYER_SHIP_ICON_Y;
 
     this.alphaOverrides = new Float32Array(stars.length).fill(1);
     this.scaleOverrides = new Float32Array(stars.length).fill(1);
@@ -361,6 +485,14 @@ export class StarFieldRenderer {
     }
   }
 
+  setSelectionMarkerStar(starId: number): void {
+    this.selectionMarkerStarId = starId;
+  }
+
+  setPlayerShipStar(starId: number): void {
+    this.playerShipStarId = starId;
+  }
+
   /**
    * Set zoom blend where 0 = fully zoomed-in and 1 = fully zoomed-out.
    * At higher values stars get larger and brighter for map readability.
@@ -484,9 +616,79 @@ export class StarFieldRenderer {
         ),
       );
     }
+
+    this.applySelectionMarkerVisual();
+    this.applyPlayerShipIconVisual();
+  }
+
+  private applySelectionMarkerVisual(): void {
+    const starId = this.selectionMarkerStarId;
+    const hasSelection =
+      this.starsVisible
+      && starId >= 0
+      && starId < this.starPositions.length;
+
+    if (!hasSelection) {
+      this.selectionMarkerRoot.setEnabled(false);
+      this.selectionGlowLayer.intensity = 0;
+      return;
+    }
+
+    const pulse = 0.5 + 0.5 * Math.sin(this.elapsedTime * SELECTION_MARKER_PULSE_SPEED);
+    const markerScale = 1 - SELECTION_MARKER_SCALE_PULSE + pulse * SELECTION_MARKER_SCALE_PULSE * 2;
+    const pos = this.starPositions[starId];
+    this.selectionMarkerRoot.position.set(pos.x, SELECTION_MARKER_Y, pos.z);
+    this.selectionMarkerRoot.rotation.y = this.elapsedTime * SELECTION_MARKER_ROTATION_SPEED;
+    this.selectionMarkerRoot.scaling.set(markerScale, markerScale, markerScale);
+    this.selectionMarkerMaterial.alpha = mix(
+      SELECTION_MARKER_ALPHA_MIN,
+      SELECTION_MARKER_ALPHA_MAX,
+      pulse,
+    );
+    this.selectionMarkerMaterial.emissiveColor = SELECTION_MARKER_COLOR.scale(
+      mix(SELECTION_MARKER_EMISSIVE_MIN, SELECTION_MARKER_EMISSIVE_MAX, pulse),
+    );
+    this.selectionGlowLayer.intensity = this.bloomEnabled
+      ? mix(SELECTION_MARKER_GLOW_MIN, SELECTION_MARKER_GLOW_MAX, pulse)
+      : 0;
+    this.selectionMarkerRoot.setEnabled(true);
+  }
+
+  private applyPlayerShipIconVisual(): void {
+    const starId = this.playerShipStarId;
+    const hasPlayerShip =
+      starId >= 0
+      && starId < this.starPositions.length;
+
+    if (!hasPlayerShip) {
+      this.playerShipIconSprite.isVisible = false;
+      return;
+    }
+
+    const pos = this.starPositions[starId];
+    const pulse = 1 + PLAYER_SHIP_ICON_PULSE_SCALE
+      * Math.sin(this.elapsedTime * PLAYER_SHIP_ICON_PULSE_SPEED);
+    const iconSize = mix(
+      PLAYER_SHIP_ICON_MIN_SIZE,
+      PLAYER_SHIP_ICON_MAX_SIZE,
+      this.zoomOutBlend,
+    ) * pulse;
+
+    this.playerShipIconSprite.position.set(pos.x, PLAYER_SHIP_ICON_Y, pos.z);
+    this.playerShipIconSprite.width = iconSize;
+    this.playerShipIconSprite.height = iconSize;
+    this.playerShipIconSprite.angle = Math.sin(this.elapsedTime * 0.9) * 0.06;
+    this.playerShipIconSprite.isVisible = true;
   }
 
   dispose(): void {
+    this.playerShipIconManager.dispose();
+    this.selectionGlowLayer.dispose();
+    for (const mesh of this.selectionMarkerMeshes) {
+      mesh.dispose();
+    }
+    this.selectionMarkerMaterial.dispose();
+    this.selectionMarkerRoot.dispose();
     this.haloManager.dispose();
     this.coreManager.dispose();
     this.haloSprites = [];

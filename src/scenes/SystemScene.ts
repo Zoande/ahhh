@@ -14,17 +14,26 @@ import {
   PointLight,
   MeshBuilder,
   StandardMaterial,
+  MultiMaterial,
   Texture,
   GlowLayer,
   TransformNode,
+  SceneLoader,
 } from "@babylonjs/core";
-import type { AbstractEngine, LinesMesh, Mesh } from "@babylonjs/core";
+import type { AbstractEngine, AbstractMesh, LinesMesh, Material, Mesh } from "@babylonjs/core";
+import "@babylonjs/loaders/OBJ/objFileLoader";
 import type { IGameScene } from "../SceneManager";
+import { isPlayerShipSystem } from "../data/PlayerShip";
 import { STAR_TYPES, StarType } from "../data/StarMap";
 import type { PlanetConfig, StarData, StarVisualKind } from "../data/StarMap";
 import { OrbitSystem } from "../systems/OrbitSystem";
 
 type ExitSystemHandler = () => void | Promise<void>;
+
+const PLAYER_SHIP_MODEL_ROOT = "/ships/fighter_01/";
+const PLAYER_SHIP_MODEL_FILE = "Fighter_01.obj";
+const PLAYER_SHIP_TARGET_SIZE = 11;
+const PLAYER_SHIP_BASE_POSITION = new Vector3(23, 4.8, -19);
 
 export class SystemScene implements IGameScene {
   public scene: Scene;
@@ -45,6 +54,10 @@ export class SystemScene implements IGameScene {
 
   private blackHoleDiskOuter: Mesh | null = null;
   private blackHoleDiskInner: Mesh | null = null;
+  private playerShipRoot: TransformNode | null = null;
+  private playerShipLight: PointLight | null = null;
+  private playerShipThrusterMaterial: StandardMaterial | null = null;
+  private playerShipBasePosition = PLAYER_SHIP_BASE_POSITION.clone();
 
   private orbitSystem = new OrbitSystem();
   private orbitRings: LinesMesh[] = [];
@@ -109,6 +122,7 @@ export class SystemScene implements IGameScene {
     this.setupCamera(canvas);
     this.setupLighting();
     this.buildSystemObjects();
+    await this.createPlayerShipIfPresent();
     this.setStarsVisible(this.starsVisible);
     this.setBloomEnabled(this.bloomEnabled);
 
@@ -133,6 +147,19 @@ export class SystemScene implements IGameScene {
     if (this.starCoronaMesh && this.starKind !== "black-hole") {
       const coronaPulse = 1 + this.coronaPulseAmplitude * Math.sin(this.elapsed * this.coronaPulseSpeed);
       this.starCoronaMesh.scaling.setAll(coronaPulse);
+    }
+
+    if (this.playerShipRoot) {
+      this.playerShipRoot.position.y =
+        this.playerShipBasePosition.y + Math.sin(this.elapsed * 1.15) * 0.32;
+      this.playerShipRoot.rotation.y += dt * 0.16;
+    }
+    if (this.playerShipThrusterMaterial) {
+      const thrusterPulse = 0.65 + 0.35 * Math.sin(this.elapsed * 5.8);
+      this.playerShipThrusterMaterial.alpha = 0.45 + thrusterPulse * 0.45;
+      this.playerShipThrusterMaterial.emissiveColor = new Color3(0.32, 0.72, 1.0).scale(
+        1.8 + thrusterPulse * 1.2,
+      );
     }
 
     if (this.starKind === "pulsar") {
@@ -631,6 +658,240 @@ export class SystemScene implements IGameScene {
     for (let i = 0; i < planets.length; i++) {
       this.createPlanet(i, planets[i]);
     }
+  }
+
+  private async createPlayerShipIfPresent(): Promise<void> {
+    if (!isPlayerShipSystem(this.star.id)) return;
+
+    this.playerShipBasePosition = PLAYER_SHIP_BASE_POSITION.clone();
+    this.playerShipRoot = new TransformNode("playerShipRoot", this.scene);
+    this.playerShipRoot.position = this.playerShipBasePosition.clone();
+    this.playerShipRoot.rotation.set(0.18, -0.7, -0.08);
+
+    try {
+      const result = await SceneLoader.ImportMeshAsync(
+        "",
+        PLAYER_SHIP_MODEL_ROOT,
+        PLAYER_SHIP_MODEL_FILE,
+        this.scene,
+      );
+
+      const meshes = result.meshes.filter((mesh) => (
+        typeof mesh.getTotalVertices === "function" && mesh.getTotalVertices() > 0
+      ));
+      if (meshes.length === 0) {
+        throw new Error("Fighter_01.obj did not produce renderable meshes.");
+      }
+
+      const bounds = this.computeMeshBounds(meshes);
+      const maxDimension = Math.max(
+        0.001,
+        bounds.max.x - bounds.min.x,
+        bounds.max.y - bounds.min.y,
+        bounds.max.z - bounds.min.z,
+      );
+      const shipScale = PLAYER_SHIP_TARGET_SIZE / maxDimension;
+
+      const assetRoot = new TransformNode("playerShipAssetRoot", this.scene);
+      assetRoot.parent = this.playerShipRoot;
+      assetRoot.position = bounds.center.scale(-1);
+
+      for (const mesh of meshes) {
+        mesh.parent = assetRoot;
+        mesh.isPickable = false;
+        mesh.alwaysSelectAsActiveMesh = true;
+        this.applyPlayerShipMaterialStyle(mesh.material);
+        this.glowLayer.addIncludedOnlyMesh(mesh as Mesh);
+      }
+
+      this.playerShipRoot.scaling.setAll(shipScale);
+      this.createPlayerShipAccents(assetRoot, bounds);
+    } catch (err) {
+      console.warn("Failed to load player ship model", err);
+      this.createFallbackPlayerShip();
+    }
+  }
+
+  private computeMeshBounds(meshes: AbstractMesh[]): {
+    min: Vector3;
+    max: Vector3;
+    center: Vector3;
+  } {
+    const min = new Vector3(
+      Number.POSITIVE_INFINITY,
+      Number.POSITIVE_INFINITY,
+      Number.POSITIVE_INFINITY,
+    );
+    const max = new Vector3(
+      Number.NEGATIVE_INFINITY,
+      Number.NEGATIVE_INFINITY,
+      Number.NEGATIVE_INFINITY,
+    );
+
+    for (const mesh of meshes) {
+      mesh.computeWorldMatrix(true);
+      const corners = mesh.getBoundingInfo().boundingBox.vectorsWorld;
+      for (const corner of corners) {
+        min.minimizeInPlace(corner);
+        max.maximizeInPlace(corner);
+      }
+    }
+
+    if (!Number.isFinite(min.x) || !Number.isFinite(max.x)) {
+      return {
+        min: new Vector3(-1, -1, -1),
+        max: new Vector3(1, 1, 1),
+        center: Vector3.Zero(),
+      };
+    }
+
+    return {
+      min,
+      max,
+      center: min.add(max).scale(0.5),
+    };
+  }
+
+  private applyPlayerShipMaterialStyle(material: Material | null): void {
+    if (!material) return;
+
+    if (material instanceof MultiMaterial) {
+      for (const subMaterial of material.subMaterials) {
+        this.applyPlayerShipMaterialStyle(subMaterial);
+      }
+      return;
+    }
+
+    if (!(material instanceof StandardMaterial)) return;
+
+    const name = material.name.toLowerCase();
+    material.specularColor = new Color3(0.72, 0.78, 0.86);
+    material.emissiveColor = new Color3(0.025, 0.03, 0.04);
+
+    if (name.includes("body")) {
+      material.diffuseTexture = new Texture(
+        `${PLAYER_SHIP_MODEL_ROOT}textures/Fighter_01_Body_BaseColor.png`,
+        this.scene,
+      );
+      material.bumpTexture = new Texture(
+        `${PLAYER_SHIP_MODEL_ROOT}textures/Fighter_01_Body_Normal.png`,
+        this.scene,
+      );
+      material.emissiveColor = new Color3(0.06, 0.065, 0.08);
+      material.specularPower = 110;
+      return;
+    }
+
+    if (name.includes("front")) {
+      material.diffuseTexture = new Texture(
+        `${PLAYER_SHIP_MODEL_ROOT}textures/Fighter_01_Front_BaseColor.png`,
+        this.scene,
+      );
+      material.bumpTexture = new Texture(
+        `${PLAYER_SHIP_MODEL_ROOT}textures/Fighter_01_Front_Normal.png`,
+        this.scene,
+      );
+      material.emissiveTexture = new Texture(
+        `${PLAYER_SHIP_MODEL_ROOT}textures/Fighter_01_Front_Emissive.png`,
+        this.scene,
+      );
+      material.emissiveColor = new Color3(0.12, 0.3, 1.0).scale(1.35);
+      material.specularPower = 160;
+      return;
+    }
+
+    if (name.includes("rear")) {
+      material.diffuseTexture = new Texture(
+        `${PLAYER_SHIP_MODEL_ROOT}textures/Fighter_01_Rear_BaseColor.png`,
+        this.scene,
+      );
+      material.bumpTexture = new Texture(
+        `${PLAYER_SHIP_MODEL_ROOT}textures/Fighter_01_Rear_Normal.png`,
+        this.scene,
+      );
+      material.emissiveTexture = new Texture(
+        `${PLAYER_SHIP_MODEL_ROOT}textures/Fighter_01_Rear_Emissive.png`,
+        this.scene,
+      );
+      material.emissiveColor = new Color3(1.0, 0.18, 0.08).scale(1.25);
+      material.specularPower = 150;
+      return;
+    }
+
+    if (name.includes("windows")) {
+      material.diffuseTexture = new Texture(
+        `${PLAYER_SHIP_MODEL_ROOT}textures/Fighter_01_Windows_BaseColor.png`,
+        this.scene,
+      );
+      material.bumpTexture = new Texture(
+        `${PLAYER_SHIP_MODEL_ROOT}textures/Fighter_01_Windows_Normal.png`,
+        this.scene,
+      );
+      material.emissiveColor = new Color3(0.2, 0.85, 1.0).scale(1.15);
+      material.specularPower = 180;
+    }
+  }
+
+  private createPlayerShipAccents(
+    parent: TransformNode,
+    bounds: { min: Vector3; max: Vector3; center: Vector3 },
+  ): void {
+    if (!this.playerShipRoot) return;
+
+    const size = bounds.max.subtract(bounds.min);
+    const glowDiameter = Math.max(0.18, Math.max(size.x, size.z) * 0.045);
+    const zOffset = Math.max(0.45, size.z * 0.22);
+    const engineX = bounds.min.x - size.x * 0.035;
+
+    const thrusterMat = new StandardMaterial("playerShipThrusterMat", this.scene);
+    thrusterMat.diffuseColor = Color3.Black();
+    thrusterMat.specularColor = Color3.Black();
+    thrusterMat.emissiveColor = new Color3(0.32, 0.72, 1.0).scale(2.2);
+    thrusterMat.disableLighting = true;
+    thrusterMat.alpha = 0.78;
+    this.playerShipThrusterMaterial = thrusterMat;
+
+    for (const z of [-zOffset, zOffset]) {
+      const glow = MeshBuilder.CreateSphere(
+        "playerShipThrusterGlow",
+        { diameter: glowDiameter, segments: 16 },
+        this.scene,
+      );
+      glow.parent = parent;
+      glow.position.set(engineX, bounds.center.y, bounds.center.z + z);
+      glow.material = thrusterMat;
+      glow.isPickable = false;
+      this.glowLayer.addIncludedOnlyMesh(glow);
+    }
+
+    this.playerShipLight = new PointLight(
+      "playerShipInspectionLight",
+      new Vector3(0, 6, -8),
+      this.scene,
+    );
+    this.playerShipLight.parent = this.playerShipRoot;
+    this.playerShipLight.intensity = 1.45;
+    this.playerShipLight.range = 46;
+    this.playerShipLight.diffuse = new Color3(0.54, 0.7, 1.0);
+    this.playerShipLight.specular = new Color3(0.85, 0.9, 1.0);
+  }
+
+  private createFallbackPlayerShip(): void {
+    if (!this.playerShipRoot) return;
+
+    const body = MeshBuilder.CreateBox(
+      "playerShipFallbackBody",
+      { width: 6.8, height: 1.1, depth: 2.4 },
+      this.scene,
+    );
+    body.parent = this.playerShipRoot;
+    body.isPickable = false;
+
+    const bodyMat = new StandardMaterial("playerShipFallbackBodyMat", this.scene);
+    bodyMat.diffuseColor = new Color3(0.28, 0.33, 0.42);
+    bodyMat.emissiveColor = new Color3(0.04, 0.06, 0.1);
+    bodyMat.specularColor = new Color3(0.65, 0.7, 0.78);
+    body.material = bodyMat;
   }
 
   private createRedGiantAtmosphere(starDiameter: number, starTint: Color3): void {

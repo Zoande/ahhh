@@ -9,8 +9,9 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@babylonjs/core": "^7.34.0",
-    "@babylonjs/materials": "^7.34.0"
+    "@babylonjs/core": "^7.54.3",
+    "@babylonjs/loaders": "^7.54.3",
+    "@babylonjs/materials": "^7.54.3"
   },
   "devDependencies": {
     "@types/node": "^25.6.0",
