@@ -146,7 +146,8 @@ async function boot() {
     }
 
     await switchScene(() => {
-      const system = new SystemScene(engine, star, () => openGalaxyView());
+      const actualStarCount = cachedGalaxyStars ? cachedGalaxyStars.length : 500;
+      const system = new SystemScene(engine, star, () => openGalaxyView(), actualStarCount);
       activeSystemScene = system;
       currentSystemStar = star;
       return system;

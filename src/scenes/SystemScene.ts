@@ -32,13 +32,14 @@ type ExitSystemHandler = () => void | Promise<void>;
 
 const PLAYER_SHIP_MODEL_ROOT = "/ships/fighter_01/";
 const PLAYER_SHIP_MODEL_FILE = "Fighter_01.obj";
-const PLAYER_SHIP_TARGET_SIZE = 11;
+const PLAYER_SHIP_TARGET_SIZE = 2.2;  // 5x smaller than original
 const PLAYER_SHIP_BASE_POSITION = new Vector3(23, 4.8, -19);
 
 export class SystemScene implements IGameScene {
   public scene: Scene;
   private engine: AbstractEngine;
   private star: StarData;
+  private starCount: number;  // Track actual star count for player ship detection
   private readonly onExitSystem: ExitSystemHandler;
 
   private camera!: ArcRotateCamera;
@@ -106,12 +107,14 @@ export class SystemScene implements IGameScene {
     this.requestExit();
   };
 
-  constructor(engine: AbstractEngine, star: StarData, onExitSystem: ExitSystemHandler) {
+  constructor(engine: AbstractEngine, star: StarData, onExitSystem: ExitSystemHandler, starCount: number = 500) {
     this.engine = engine;
     this.star = star;
+    this.starCount = starCount;
     this.onExitSystem = onExitSystem;
     this.scene = new Scene(engine);
     this.scene.clearColor = new Color4(0.01, 0.015, 0.03, 1);
+    console.log(`📍 SystemScene init: star.id=${star.id}, totalStarCount=${starCount}`);
   }
 
   async setup(): Promise<void> {
@@ -661,14 +664,20 @@ export class SystemScene implements IGameScene {
   }
 
   private async createPlayerShipIfPresent(): Promise<void> {
-    if (!isPlayerShipSystem(this.star.id)) return;
+    console.log(`🔍 Checking player ship: star.id=${this.star.id}, using starCount=${this.starCount}`);
+    if (!isPlayerShipSystem(this.star.id, this.starCount)) return;
+    console.log(`✅ This is the player ship system!`);
+
+    console.log(`🚀 Loading player ship for star ID ${this.star.id}`);
 
     this.playerShipBasePosition = PLAYER_SHIP_BASE_POSITION.clone();
     this.playerShipRoot = new TransformNode("playerShipRoot", this.scene);
     this.playerShipRoot.position = this.playerShipBasePosition.clone();
     this.playerShipRoot.rotation.set(0.18, -0.7, -0.08);
+    console.log(`📍 Player ship root position: ${JSON.stringify(this.playerShipBasePosition)}`);
 
     try {
+      console.log(`📦 Importing ${PLAYER_SHIP_MODEL_FILE} from ${PLAYER_SHIP_MODEL_ROOT}`);
       const result = await SceneLoader.ImportMeshAsync(
         "",
         PLAYER_SHIP_MODEL_ROOT,
@@ -676,9 +685,11 @@ export class SystemScene implements IGameScene {
         this.scene,
       );
 
+      console.log(`✓ Loaded ${result.meshes.length} total meshes from OBJ`);
       const meshes = result.meshes.filter((mesh) => (
         typeof mesh.getTotalVertices === "function" && mesh.getTotalVertices() > 0
       ));
+      console.log(`✓ Filtered to ${meshes.length} renderable meshes`);
       if (meshes.length === 0) {
         throw new Error("Fighter_01.obj did not produce renderable meshes.");
       }
@@ -690,7 +701,9 @@ export class SystemScene implements IGameScene {
         bounds.max.y - bounds.min.y,
         bounds.max.z - bounds.min.z,
       );
+      console.log(`📐 Bounds: min=${JSON.stringify(bounds.min)}, max=${JSON.stringify(bounds.max)}, maxDim=${maxDimension}`);
       const shipScale = PLAYER_SHIP_TARGET_SIZE / maxDimension;
+      console.log(`📏 Scaling to ${PLAYER_SHIP_TARGET_SIZE} world units: scale=${shipScale}`);
 
       const assetRoot = new TransformNode("playerShipAssetRoot", this.scene);
       assetRoot.parent = this.playerShipRoot;
@@ -700,14 +713,15 @@ export class SystemScene implements IGameScene {
         mesh.parent = assetRoot;
         mesh.isPickable = false;
         mesh.alwaysSelectAsActiveMesh = true;
+        console.log(`  - Mesh "${mesh.name}": vertices=${mesh.getTotalVertices()}`);
         this.applyPlayerShipMaterialStyle(mesh.material);
         this.glowLayer.addIncludedOnlyMesh(mesh as Mesh);
       }
 
       this.playerShipRoot.scaling.setAll(shipScale);
-      this.createPlayerShipAccents(assetRoot, bounds);
+      console.log(`✅ Player ship loaded successfully! Root position: ${JSON.stringify(this.playerShipRoot.position)}, rotation: ${JSON.stringify(this.playerShipRoot.rotation)}`);
     } catch (err) {
-      console.warn("Failed to load player ship model", err);
+      console.warn("❌ Failed to load player ship model", err);
       this.createFallbackPlayerShip();
     }
   }
@@ -1199,6 +1213,9 @@ export class SystemScene implements IGameScene {
     this.starsVisible = visible;
     if (this.starMesh) {
       this.starMesh.setEnabled(visible);
+    }
+    if (this.playerShipRoot) {
+      this.playerShipRoot.setEnabled(visible);
     }
   }
 
