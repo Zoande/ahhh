@@ -22,13 +22,14 @@ import {
 } from "@babylonjs/core";
 import type { AbstractEngine, AbstractMesh, LinesMesh, Material, Mesh } from "@babylonjs/core";
 import "@babylonjs/loaders/OBJ/objFileLoader";
+import "@babylonjs/loaders/glTF";
 import type { IGameScene } from "../SceneManager";
 import { isPlayerShipSystem } from "../data/PlayerShip";
 import { isStarbaseSystem } from "../data/Starbase";
 import { STAR_TYPES, StarType } from "../data/StarMap";
 import type { PlanetConfig, StarData, StarVisualKind } from "../data/StarMap";
 import { OrbitSystem } from "../systems/OrbitSystem";
-// FBX loading is handled by @babylonjs/loaders module
+// OBJ and glTF loading are handled by @babylonjs/loaders modules
 
 type ExitSystemHandler = () => void | Promise<void>;
 
@@ -37,7 +38,7 @@ const PLAYER_SHIP_MODEL_FILE = "Fighter_01.obj";
 const PLAYER_SHIP_TARGET_SIZE = 2.2;  // 5x smaller than original
 const PLAYER_SHIP_BASE_POSITION = new Vector3(23, 4.8, -19);
 
-const STARBASE_BASE_POSITION = new Vector3(0, 0, -10);  // Close to star, with extra clearance
+const STARBASE_MODEL_URL = new URL("../../star_trek_-_starbase_375.glb", import.meta.url).toString();
 
 export class SystemScene implements IGameScene {
   public scene: Scene;
@@ -132,22 +133,89 @@ export class SystemScene implements IGameScene {
 
     const starRadius = Math.max(0.6, this.starDiameter * 0.5);
     const starbaseBasePosition = new Vector3(
-      Math.max(8, this.starDiameter * 0.9),
-      Math.max(1.2, this.starDiameter * 0.08),
-      -(starRadius + Math.max(18, this.starDiameter * 2.2)),
+      3.2,
+      8.5,
+      -(starRadius + 4.5 + 10),
     );
     this.starbaseRoot = new TransformNode("starbaseRoot", this.scene);
     this.starbaseRoot.position = starbaseBasePosition.clone();
-    this.starbaseRoot.rotation.set(0.18, 0.42, 0.05);
+    this.starbaseRoot.rotation.set(0.18, 0.2, 0.05);
     console.log(`📍 Starbase root position: ${JSON.stringify(starbaseBasePosition)}`);
 
-    this.createProceduralStarbase();
+    try {
+      console.log(`📦 Importing starbase GLB from ${STARBASE_MODEL_URL}`);
+      const result = await SceneLoader.ImportMeshAsync("", "", STARBASE_MODEL_URL, this.scene);
+
+      console.log(`✓ Loaded ${result.meshes.length} total meshes from GLB`);
+      const meshes = result.meshes.filter((mesh) => (
+        typeof mesh.getTotalVertices === "function" && mesh.getTotalVertices() > 0
+      ));
+      console.log(`✓ Filtered to ${meshes.length} renderable meshes`);
+      if (meshes.length === 0) {
+        throw new Error("star_trek_-_starbase_375.glb did not produce renderable meshes.");
+      }
+
+      const bounds = this.computeMeshBounds(meshes);
+      const maxDimension = Math.max(
+        0.001,
+        bounds.max.x - bounds.min.x,
+        bounds.max.y - bounds.min.y,
+        bounds.max.z - bounds.min.z,
+      );
+      console.log(`📐 Bounds: min=${JSON.stringify(bounds.min)}, max=${JSON.stringify(bounds.max)}, maxDim=${maxDimension}`);
+
+      const starbaseTargetSize = 15.0;
+      const starbaseScale = starbaseTargetSize / maxDimension;
+      console.log(`📏 Scaling to ${starbaseTargetSize} world units: scale=${starbaseScale}`);
+
+      const assetRoot = new TransformNode("starbaseAssetRoot", this.scene);
+      assetRoot.parent = this.starbaseRoot;
+      assetRoot.position = bounds.center.scale(-1);
+
+      for (const mesh of meshes) {
+        this.trimStarbaseVertexData(mesh);
+        mesh.parent = assetRoot;
+        mesh.isPickable = false;
+        mesh.alwaysSelectAsActiveMesh = true;
+        this.glowLayer.addIncludedOnlyMesh(mesh as Mesh);
+      }
+
+      this.starbaseRoot.scaling.setAll(starbaseScale);
+
+      this.starbaseLight = new PointLight(
+        "starbaseInspectionLight",
+        new Vector3(0, 6, -10),
+        this.scene,
+      );
+      this.starbaseLight.parent = this.starbaseRoot;
+      this.starbaseLight.intensity = 1.0;
+      this.starbaseLight.range = 42;
+      this.starbaseLight.diffuse = new Color3(0.58, 0.86, 1.0);
+      this.starbaseLight.specular = new Color3(0.85, 0.92, 1.0);
+
+      console.log(`✅ Starbase GLB loaded successfully! Root position: ${JSON.stringify(this.starbaseRoot.position)}`);
+    } catch (err) {
+      console.warn("❌ Failed to load starbase GLB, falling back to procedural starbase", err);
+      this.createProceduralStarbaseFallback();
+    }
   }
 
-  private createProceduralStarbase(): void {
-    if (!this.starbaseRoot) return;
+  private trimStarbaseVertexData(mesh: AbstractMesh): void {
+    const allowedKinds = new Set(["position", "normal", "uv"]);
+    const concreteMesh = mesh as Mesh;
+    const kinds = concreteMesh.getVerticesDataKinds();
 
-    console.log("🛠 Building procedural starbase fallback");
+    for (const kind of kinds) {
+      if (!allowedKinds.has(kind)) {
+        concreteMesh.removeVerticesData(kind);
+      }
+    }
+
+    console.log(`🧹 Trimmed ${mesh.name}: ${kinds.join(", ")}`);
+  }
+
+  private createProceduralStarbaseFallback(): void {
+    if (!this.starbaseRoot) return;
 
     const hullMat = new StandardMaterial("starbaseHullMat", this.scene);
     hullMat.diffuseColor = new Color3(0.2, 0.24, 0.3);
@@ -203,85 +271,20 @@ export class SystemScene implements IGameScene {
     hub.material = hubMat;
     hub.isPickable = false;
 
-    const armSpecs = [
-      { name: "north", x: 0, z: 2.6, rotationY: 0 },
-      { name: "south", x: 0, z: -2.6, rotationY: 0 },
-      { name: "east", x: 2.6, z: 0, rotationY: Math.PI / 2 },
-      { name: "west", x: -2.6, z: 0, rotationY: Math.PI / 2 },
-    ];
-
-    for (const arm of armSpecs) {
-      const armBody = MeshBuilder.CreateBox(
-        `starbaseArm_${arm.name}`,
-        { width: 2.6, height: 0.38, depth: 0.72 },
-        this.scene,
-      );
-      armBody.parent = this.starbaseRoot;
-      armBody.position.set(arm.x, 0, arm.z);
-      armBody.rotation.y = arm.rotationY;
-      armBody.material = hullMat;
-      armBody.isPickable = false;
-
-      const armPad = MeshBuilder.CreateCylinder(
-        `starbaseArmPad_${arm.name}`,
-        { height: 0.28, diameter: 0.82, tessellation: 16 },
-        this.scene,
-      );
-      armPad.parent = this.starbaseRoot;
-      armPad.position.set(arm.x * 1.42, 0, arm.z * 1.42);
-      armPad.rotation.x = Math.PI / 2;
-      armPad.material = accentMat;
-      armPad.isPickable = false;
-
-      this.glowLayer.addIncludedOnlyMesh(armPad);
-    }
-
-    const topDome = MeshBuilder.CreateSphere(
-      "starbaseTopDome",
-      { diameter: 1.05, segments: 18 },
-      this.scene,
-    );
-    topDome.parent = this.starbaseRoot;
-    topDome.position.y = 1.55;
-    topDome.material = accentMat;
-    topDome.isPickable = false;
-
-    const bottomCap = MeshBuilder.CreateCylinder(
-      "starbaseBottomCap",
-      { height: 0.5, diameterTop: 1.1, diameterBottom: 1.35, tessellation: 20 },
-      this.scene,
-    );
-    bottomCap.parent = this.starbaseRoot;
-    bottomCap.position.y = -1.55;
-    bottomCap.material = hubMat;
-    bottomCap.isPickable = false;
-
-    const beacon = MeshBuilder.CreateSphere(
-      "starbaseBeacon",
-      { diameter: 0.25, segments: 12 },
-      this.scene,
-    );
-    beacon.parent = this.starbaseRoot;
-    beacon.position.set(0, 1.95, 0);
-    beacon.material = accentMat;
-    beacon.isPickable = false;
-
-    for (const mesh of [core, ring, hub, topDome, bottomCap, beacon]) {
-      this.glowLayer.addIncludedOnlyMesh(mesh);
-    }
+    this.glowLayer.addIncludedOnlyMesh(core);
+    this.glowLayer.addIncludedOnlyMesh(ring);
+    this.glowLayer.addIncludedOnlyMesh(hub);
 
     this.starbaseLight = new PointLight(
       "starbaseInspectionLight",
-      new Vector3(0, 2.7, -2.2),
+      new Vector3(0, 6, -10),
       this.scene,
     );
     this.starbaseLight.parent = this.starbaseRoot;
-    this.starbaseLight.intensity = 1.05;
-    this.starbaseLight.range = 28;
+    this.starbaseLight.intensity = 1.0;
+    this.starbaseLight.range = 42;
     this.starbaseLight.diffuse = new Color3(0.58, 0.86, 1.0);
     this.starbaseLight.specular = new Color3(0.85, 0.92, 1.0);
-
-    console.log("✅ Procedural starbase built successfully");
   }
 
   async setup(): Promise<void> {
