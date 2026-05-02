@@ -24,9 +24,11 @@ import type { AbstractEngine, AbstractMesh, LinesMesh, Material, Mesh } from "@b
 import "@babylonjs/loaders/OBJ/objFileLoader";
 import type { IGameScene } from "../SceneManager";
 import { isPlayerShipSystem } from "../data/PlayerShip";
+import { isStarbaseSystem } from "../data/Starbase";
 import { STAR_TYPES, StarType } from "../data/StarMap";
 import type { PlanetConfig, StarData, StarVisualKind } from "../data/StarMap";
 import { OrbitSystem } from "../systems/OrbitSystem";
+// FBX loading is handled by @babylonjs/loaders module
 
 type ExitSystemHandler = () => void | Promise<void>;
 
@@ -34,6 +36,8 @@ const PLAYER_SHIP_MODEL_ROOT = "/ships/fighter_01/";
 const PLAYER_SHIP_MODEL_FILE = "Fighter_01.obj";
 const PLAYER_SHIP_TARGET_SIZE = 2.2;  // 5x smaller than original
 const PLAYER_SHIP_BASE_POSITION = new Vector3(23, 4.8, -19);
+
+const STARBASE_BASE_POSITION = new Vector3(0, 0, -10);  // Close to star, with extra clearance
 
 export class SystemScene implements IGameScene {
   public scene: Scene;
@@ -47,6 +51,7 @@ export class SystemScene implements IGameScene {
   private starMesh: Mesh | null = null;
   private starDetailMesh: Mesh | null = null;
   private starCoronaMesh: Mesh | null = null;
+  private starDiameter = 1.2;
   private starLight: PointLight | null = null;
   private fillLight: PointLight | null = null;
 
@@ -59,6 +64,9 @@ export class SystemScene implements IGameScene {
   private playerShipLight: PointLight | null = null;
   private playerShipThrusterMaterial: StandardMaterial | null = null;
   private playerShipBasePosition = PLAYER_SHIP_BASE_POSITION.clone();
+
+  private starbaseRoot: TransformNode | null = null;
+  private starbaseLight: PointLight | null = null;
 
   private orbitSystem = new OrbitSystem();
   private orbitRings: LinesMesh[] = [];
@@ -117,6 +125,165 @@ export class SystemScene implements IGameScene {
     console.log(`📍 SystemScene init: star.id=${star.id}, totalStarCount=${starCount}`);
   }
 
+  private async createStarbaseIfPresent(): Promise<void> {
+    console.log(`🔍 Checking starbase: star.id=${this.star.id}, using starCount=${this.starCount}`);
+    if (!isStarbaseSystem(this.star.id, this.starCount)) return;
+    console.log(`✅ This is the starbase system!`);
+
+    const starRadius = Math.max(0.6, this.starDiameter * 0.5);
+    const starbaseBasePosition = new Vector3(
+      Math.max(8, this.starDiameter * 0.9),
+      Math.max(1.2, this.starDiameter * 0.08),
+      -(starRadius + Math.max(18, this.starDiameter * 2.2)),
+    );
+    this.starbaseRoot = new TransformNode("starbaseRoot", this.scene);
+    this.starbaseRoot.position = starbaseBasePosition.clone();
+    this.starbaseRoot.rotation.set(0.18, 0.42, 0.05);
+    console.log(`📍 Starbase root position: ${JSON.stringify(starbaseBasePosition)}`);
+
+    this.createProceduralStarbase();
+  }
+
+  private createProceduralStarbase(): void {
+    if (!this.starbaseRoot) return;
+
+    console.log("🛠 Building procedural starbase fallback");
+
+    const hullMat = new StandardMaterial("starbaseHullMat", this.scene);
+    hullMat.diffuseColor = new Color3(0.2, 0.24, 0.3);
+    hullMat.specularColor = new Color3(0.45, 0.5, 0.58);
+    hullMat.emissiveColor = new Color3(0.03, 0.05, 0.08);
+
+    const accentMat = new StandardMaterial("starbaseAccentMat", this.scene);
+    accentMat.diffuseColor = Color3.Black();
+    accentMat.specularColor = Color3.Black();
+    accentMat.disableLighting = true;
+    accentMat.emissiveColor = new Color3(0.48, 0.84, 1.0).scale(1.5);
+    accentMat.alpha = 0.95;
+
+    const hubMat = new StandardMaterial("starbaseHubMat", this.scene);
+    hubMat.diffuseColor = new Color3(0.34, 0.38, 0.46);
+    hubMat.specularColor = new Color3(0.62, 0.68, 0.75);
+    hubMat.emissiveColor = new Color3(0.04, 0.06, 0.1);
+
+    const core = MeshBuilder.CreateCylinder(
+      "starbaseCore",
+      {
+        height: 2.8,
+        diameterTop: 1.7,
+        diameterBottom: 1.9,
+        tessellation: 28,
+      },
+      this.scene,
+    );
+    core.parent = this.starbaseRoot;
+    core.material = hullMat;
+    core.isPickable = false;
+
+    const ring = MeshBuilder.CreateTorus(
+      "starbaseRing",
+      {
+        diameter: 5.2,
+        thickness: 0.28,
+        tessellation: 64,
+      },
+      this.scene,
+    );
+    ring.parent = this.starbaseRoot;
+    ring.rotation.x = Math.PI / 2;
+    ring.material = accentMat;
+    ring.isPickable = false;
+
+    const hub = MeshBuilder.CreateSphere(
+      "starbaseHub",
+      { diameter: 1.25, segments: 20 },
+      this.scene,
+    );
+    hub.parent = this.starbaseRoot;
+    hub.material = hubMat;
+    hub.isPickable = false;
+
+    const armSpecs = [
+      { name: "north", x: 0, z: 2.6, rotationY: 0 },
+      { name: "south", x: 0, z: -2.6, rotationY: 0 },
+      { name: "east", x: 2.6, z: 0, rotationY: Math.PI / 2 },
+      { name: "west", x: -2.6, z: 0, rotationY: Math.PI / 2 },
+    ];
+
+    for (const arm of armSpecs) {
+      const armBody = MeshBuilder.CreateBox(
+        `starbaseArm_${arm.name}`,
+        { width: 2.6, height: 0.38, depth: 0.72 },
+        this.scene,
+      );
+      armBody.parent = this.starbaseRoot;
+      armBody.position.set(arm.x, 0, arm.z);
+      armBody.rotation.y = arm.rotationY;
+      armBody.material = hullMat;
+      armBody.isPickable = false;
+
+      const armPad = MeshBuilder.CreateCylinder(
+        `starbaseArmPad_${arm.name}`,
+        { height: 0.28, diameter: 0.82, tessellation: 16 },
+        this.scene,
+      );
+      armPad.parent = this.starbaseRoot;
+      armPad.position.set(arm.x * 1.42, 0, arm.z * 1.42);
+      armPad.rotation.x = Math.PI / 2;
+      armPad.material = accentMat;
+      armPad.isPickable = false;
+
+      this.glowLayer.addIncludedOnlyMesh(armPad);
+    }
+
+    const topDome = MeshBuilder.CreateSphere(
+      "starbaseTopDome",
+      { diameter: 1.05, segments: 18 },
+      this.scene,
+    );
+    topDome.parent = this.starbaseRoot;
+    topDome.position.y = 1.55;
+    topDome.material = accentMat;
+    topDome.isPickable = false;
+
+    const bottomCap = MeshBuilder.CreateCylinder(
+      "starbaseBottomCap",
+      { height: 0.5, diameterTop: 1.1, diameterBottom: 1.35, tessellation: 20 },
+      this.scene,
+    );
+    bottomCap.parent = this.starbaseRoot;
+    bottomCap.position.y = -1.55;
+    bottomCap.material = hubMat;
+    bottomCap.isPickable = false;
+
+    const beacon = MeshBuilder.CreateSphere(
+      "starbaseBeacon",
+      { diameter: 0.25, segments: 12 },
+      this.scene,
+    );
+    beacon.parent = this.starbaseRoot;
+    beacon.position.set(0, 1.95, 0);
+    beacon.material = accentMat;
+    beacon.isPickable = false;
+
+    for (const mesh of [core, ring, hub, topDome, bottomCap, beacon]) {
+      this.glowLayer.addIncludedOnlyMesh(mesh);
+    }
+
+    this.starbaseLight = new PointLight(
+      "starbaseInspectionLight",
+      new Vector3(0, 2.7, -2.2),
+      this.scene,
+    );
+    this.starbaseLight.parent = this.starbaseRoot;
+    this.starbaseLight.intensity = 1.05;
+    this.starbaseLight.range = 28;
+    this.starbaseLight.diffuse = new Color3(0.58, 0.86, 1.0);
+    this.starbaseLight.specular = new Color3(0.85, 0.92, 1.0);
+
+    console.log("✅ Procedural starbase built successfully");
+  }
+
   async setup(): Promise<void> {
     const canvas = this.engine.getRenderingCanvas()!;
 
@@ -126,6 +293,7 @@ export class SystemScene implements IGameScene {
     this.setupLighting();
     this.buildSystemObjects();
     await this.createPlayerShipIfPresent();
+    await this.createStarbaseIfPresent();
     this.setStarsVisible(this.starsVisible);
     this.setBloomEnabled(this.bloomEnabled);
 
@@ -573,6 +741,7 @@ export class SystemScene implements IGameScene {
     const typeCfg = STAR_TYPES[this.star.type];
     const starTint = new Color3(this.star.color[0], this.star.color[1], this.star.color[2]);
     const starDiameter = Math.max(1.2, typeCfg.systemDiameter * this.systemScaleMultiplier);
+    this.starDiameter = starDiameter;
 
     this.starMesh = MeshBuilder.CreateSphere(
       "systemStar",

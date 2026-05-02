@@ -112,6 +112,13 @@ const PLAYER_SHIP_ICON_Y = 2.4;
 const PLAYER_SHIP_ICON_PULSE_SPEED = 2.3;
 const PLAYER_SHIP_ICON_PULSE_SCALE = 0.09;
 
+const STARBASE_ICON_TEXTURE_SIZE = 1024;
+const STARBASE_ICON_MIN_SIZE = 15;
+const STARBASE_ICON_MAX_SIZE = 29;
+const STARBASE_ICON_Y = 2.4;
+const STARBASE_ICON_PULSE_SPEED = 2.05;
+const STARBASE_ICON_PULSE_SCALE = 0.08;
+
 function clamp01(v: number): number {
   return Math.max(0, Math.min(1, v));
 }
@@ -227,6 +234,9 @@ export class StarFieldRenderer {
   private playerShipIconManager: SpriteManager;
   private playerShipIconSprite: Sprite;
   private playerShipStarId = -1;
+  private starbaseIconManager: SpriteManager;
+  private starbaseIconSprite: Sprite;
+  private starbaseStarId = -1;
 
   // Current per-star overrides (applied each frame via applyVisuals)
   private alphaOverrides: Float32Array;
@@ -310,6 +320,22 @@ export class StarFieldRenderer {
     this.playerShipIconSprite = new Sprite("player_ship_icon", this.playerShipIconManager);
     this.playerShipIconSprite.isVisible = false;
     this.playerShipIconSprite.position.y = PLAYER_SHIP_ICON_Y;
+
+    this.starbaseIconManager = new SpriteManager(
+      "starbaseIconSprites",
+      new URL("../../own_starbase_icon.png", import.meta.url).toString(),
+      1,
+      {
+        width: STARBASE_ICON_TEXTURE_SIZE,
+        height: STARBASE_ICON_TEXTURE_SIZE,
+      },
+      scene,
+    );
+    this.starbaseIconManager.isPickable = false;
+    this.starbaseIconManager.fogEnabled = false;
+    this.starbaseIconSprite = new Sprite("starbase_icon", this.starbaseIconManager);
+    this.starbaseIconSprite.isVisible = false;
+    this.starbaseIconSprite.position.y = STARBASE_ICON_Y;
 
     this.alphaOverrides = new Float32Array(stars.length).fill(1);
     this.scaleOverrides = new Float32Array(stars.length).fill(1);
@@ -493,6 +519,10 @@ export class StarFieldRenderer {
     this.playerShipStarId = starId;
   }
 
+  setStarbaseStar(starId: number): void {
+    this.starbaseStarId = starId;
+  }
+
   /**
    * Set zoom blend where 0 = fully zoomed-in and 1 = fully zoomed-out.
    * At higher values stars get larger and brighter for map readability.
@@ -619,6 +649,7 @@ export class StarFieldRenderer {
 
     this.applySelectionMarkerVisual();
     this.applyPlayerShipIconVisual();
+    this.applyStarbaseIconVisual();
   }
 
   private applySelectionMarkerVisual(): void {
@@ -681,8 +712,34 @@ export class StarFieldRenderer {
     this.playerShipIconSprite.isVisible = true;
   }
 
+  private applyStarbaseIconVisual(): void {
+    const starId = this.starbaseStarId;
+    const hasStarbase = starId >= 0 && starId < this.starPositions.length;
+
+    if (!hasStarbase) {
+      this.starbaseIconSprite.isVisible = false;
+      return;
+    }
+
+    const pos = this.starPositions[starId];
+    const pulse = 1 + STARBASE_ICON_PULSE_SCALE
+      * Math.sin(this.elapsedTime * STARBASE_ICON_PULSE_SPEED);
+    const iconSize = mix(
+      STARBASE_ICON_MIN_SIZE,
+      STARBASE_ICON_MAX_SIZE,
+      this.zoomOutBlend,
+    ) * pulse;
+
+    this.starbaseIconSprite.position.set(pos.x, STARBASE_ICON_Y, pos.z);
+    this.starbaseIconSprite.width = iconSize;
+    this.starbaseIconSprite.height = iconSize;
+    this.starbaseIconSprite.angle = Math.sin(this.elapsedTime * 0.8) * 0.05;
+    this.starbaseIconSprite.isVisible = true;
+  }
+
   dispose(): void {
     this.playerShipIconManager.dispose();
+    this.starbaseIconManager.dispose();
     this.selectionGlowLayer.dispose();
     for (const mesh of this.selectionMarkerMeshes) {
       mesh.dispose();

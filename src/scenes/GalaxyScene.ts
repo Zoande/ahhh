@@ -18,6 +18,7 @@ import type { AbstractEngine, Mesh, Observer, PointerInfo } from "@babylonjs/cor
 import type { IGameScene } from "../SceneManager";
 import { GALAXY_MAP } from "../data/GalaxyMap";
 import { getPlayerShipStarId } from "../data/PlayerShip";
+import { getStarbaseStarId } from "../data/Starbase";
 import { generateStarMap } from "../data/StarMap";
 import type { StarData } from "../data/StarMap";
 import { CameraController } from "../systems/CameraController";
@@ -765,6 +766,7 @@ export class GalaxyScene implements IGameScene {
   private hyperlaneAdjacency: number[][] = [];
   private starOwnership: number[] = [];
   private playerShipStarId = -1;
+    private starbaseStarId = -1;
   private galacticCoreMeshes: Mesh[] = [];
   private galacticCoreSpinSpeeds: number[] = [];
   private hoveredStarId = -1;
@@ -819,6 +821,7 @@ export class GalaxyScene implements IGameScene {
           cfg.shape,
         );
     this.playerShipStarId = getPlayerShipStarId(this.stars.length, cfg.seed);
+    this.starbaseStarId = getStarbaseStarId(this.stars.length, cfg.seed);
 
     const initialViewState = this.options.initialViewState;
 
@@ -875,6 +878,7 @@ export class GalaxyScene implements IGameScene {
 
     this.starField = new StarFieldRenderer(this.scene, this.stars);
     this.starField.setPlayerShipStar(this.playerShipStarId);
+    this.starField.setStarbaseStar(this.starbaseStarId);
 
     this.pointerObserver = this.scene.onPointerObservable.add((pointerInfo) => {
       if (pointerInfo.type === PointerEventTypes.POINTERMOVE) {
